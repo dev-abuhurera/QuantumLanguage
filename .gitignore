@@ -42,3 +42,7 @@ test_results.txt
 /Quantum Language.txt
 /.txtconfig
 /.txtignore
+
+/QuantumLanguage.txt
+/build_errors.txt
+/build_log.txt
