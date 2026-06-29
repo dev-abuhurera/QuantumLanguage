@@ -1119,19 +1119,14 @@ ASTNodePtr Parser::parseCTypeVarDecl(const std::string &typeHint)
     ASTNodePtr init;
     if (match(TokenType::ASSIGN))
         init = parseExpr();
-    while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
-        consume();
     auto decl = VarDecl{false, nameToken.value, std::move(init), finalTypeHint};
     decl.isPointer = isPointer;
     auto node = std::make_unique<ASTNode>(std::move(decl), ln);
-    // Consume trailing semicolon/newline only when NOT in a comma list
-    // (the caller handles termination for multi-var declarations)
-    // We stop here so the caller can check for ',' before consuming.
-    // But if there's a semicolon right now and no comma coming, eat it.
-    if (!check(TokenType::COMMA))
-    {
-        while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
-            consume();
-    }
+    // Do NOT consume trailing semicolons here — callers that need them (for-loop init,
+    // multi-var comma lists) handle their own terminators.  Eating ';' here would
+    // swallow the separator in  for (int i = 0; i < n; i++)  and break the parse.
+    // Only skip bare newlines that are purely cosmetic whitespace.
+    while (check(TokenType::NEWLINE))
+        consume();
     return node;
 }

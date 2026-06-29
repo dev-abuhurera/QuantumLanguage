@@ -26,3 +26,7 @@
 	path = tests
 	url = https://github.com/QuantumLogicsLabs/QuantumFailedTests.git
 	branch = main
+[submodule "installer"]
+	path= installer
+	url= https://github.com/QuantumLogicsLabs/quantumlanguage-windowsinstaller.git
+	branch=main

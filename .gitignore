@@ -43,3 +43,11 @@ test_results.txt
 /Quantum Language.txt
 /.txtconfig
 /.txtignore
+
+/QuantumLanguage.txt
+/build_errors.txt
+/build_log.txt
+
+
+/memory_profile.txt
+/memory_leak_report.txt

@@ -65,6 +65,8 @@ ASTNodePtr Parser::parseStatement()
             if (check(TokenType::CONST))
                 consume();
             auto firstDecl = parseCTypeVarDecl(typeHint);
+            while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
+                consume();
             if (!check(TokenType::COMMA))
                 return firstDecl;
             auto block = std::make_unique<ASTNode>(BlockStmt{}, ln);
@@ -80,6 +82,8 @@ ASTNodePtr Parser::parseStatement()
                         hint += " " + consume().value;
                 }
                 block->as<BlockStmt>().statements.push_back(parseCTypeVarDecl(hint));
+                while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
+                    consume();
             }
             while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
                 consume();
@@ -312,6 +316,8 @@ ASTNodePtr Parser::parseStatement()
             // Build a block of VarDecls for comma-separated names.
             {
                 auto firstDecl = parseCTypeVarDecl(typeHint);
+                while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
+                    consume();
                 if (!check(TokenType::COMMA))
                     return firstDecl;
                 // Multi-var: int a, b, c;  or  int a, *b, c = 5;  or  int a, int b, int c;
@@ -329,6 +335,8 @@ ASTNodePtr Parser::parseStatement()
                             hint += " " + consume().value;
                     }
                     block->as<BlockStmt>().statements.push_back(parseCTypeVarDecl(hint));
+                    while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
+                        consume();
                 }
                 while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
                     consume();
@@ -342,7 +350,10 @@ ASTNodePtr Parser::parseStatement()
             auto typeHint = consume().value;
             while (isCTypeKeyword(current().type) || check(TokenType::CONST))
                 typeHint += " " + consume().value;
-            return parseCTypeVarDecl(typeHint);
+            auto fpDecl = parseCTypeVarDecl(typeHint);
+            while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
+                consume();
+            return fpDecl;
         }
         // Not a declaration — fall through to expression statement
         return parseExprStmt();
@@ -951,6 +962,26 @@ ASTNodePtr Parser::parseFunctionDecl()
     }
 
     match(TokenType::COLON); // optional Python-style colon
+    // C++ constructor initializer list: skip  member(val), member2(val2)  before body
+    if (check(TokenType::IDENTIFIER))
+    {
+        size_t la = pos + 1;
+        while (la < tokens.size() && tokens[la].type == TokenType::NEWLINE) la++;
+        if (la < tokens.size() &&
+            (tokens[la].type == TokenType::LPAREN || tokens[la].type == TokenType::LBRACE))
+        {
+            while (!atEnd() && !check(TokenType::LBRACE) && !check(TokenType::INDENT))
+            {
+                if (check(TokenType::NEWLINE)) {
+                    size_t la2 = pos + 1;
+                    while (la2 < tokens.size() && tokens[la2].type == TokenType::NEWLINE) la2++;
+                    if (la2 >= tokens.size() || tokens[la2].type == TokenType::LBRACE
+                        || tokens[la2].type == TokenType::INDENT) break;
+                }
+                consume();
+            }
+        }
+    }
     skipNewlines();
 
     // ── C++ forward declaration / prototype support ───────────────────────────
@@ -1201,7 +1232,37 @@ ASTNodePtr Parser::parseClassDecl()
                     // Peek: if the token after this identifier is another identifier (var name)
                     // AND that identifier is NOT followed by '(' (i.e. it's a field, not a method)
                     size_t la = pos + 1;
+                    // Skip template arguments on the return type: vector<int>, shared_ptr<Foo>, etc.
+                    if (la < tokens.size() && tokens[la].type == TokenType::LT)
+                    {
+                        int tdepth = 0;
+                        while (la < tokens.size())
+                        {
+                            if (tokens[la].type == TokenType::LT)
+                                tdepth++;
+                            else if (tokens[la].type == TokenType::GT)
+                            {
+                                tdepth--;
+                                la++;
+                                break;
+                            }
+                            else if (tokens[la].type == TokenType::RSHIFT)
+                            {
+                                tdepth -= 2;
+                                la++;
+                                break;
+                            }
+                            else if (tokens[la].type == TokenType::SEMICOLON ||
+                                     tokens[la].type == TokenType::NEWLINE ||
+                                     tokens[la].type == TokenType::LBRACE)
+                                break;
+                            la++;
+                        }
+                    }
                     while (la < tokens.size() && tokens[la].type == TokenType::BIT_AND)
+                        la++;
+                    // Also skip pointer stars between return type and method name
+                    while (la < tokens.size() && tokens[la].type == TokenType::STAR)
                         la++;
                     if (la < tokens.size() && tokens[la].type == TokenType::IDENTIFIER && tokens[la].value != cd.name) // not constructor pattern
                     {
@@ -1211,10 +1272,30 @@ ASTNodePtr Parser::parseClassDecl()
                             la2++;
                         if (la2 < tokens.size() && tokens[la2].type == TokenType::LPAREN)
                         {
-                            // This is a return-type + method-name pattern (e.g. "string getHeroName()")
-                            // Don't treat as member var — treat it as method with return type prefix
-                            // We'll consume the type token as a return type hint and fall through to method parsing
-                            consume(); // eat return type (e.g. "string", "int", "void")
+                            // This is a return-type + method-name pattern (e.g. "string getHeroName()"
+                            // or "vector<int> getNeighbors()")
+                            // Consume the return type identifier and any template args
+                            consume(); // eat return type (e.g. "string", "vector")
+                            // Skip template arguments if present: <int>, <Node*>, etc.
+                            if (check(TokenType::LT))
+                            {
+                                consume(); // eat '<'
+                                int tdepth = 1;
+                                while (!atEnd() && tdepth > 0)
+                                {
+                                    if (check(TokenType::LT))
+                                        tdepth++;
+                                    else if (check(TokenType::GT))
+                                        tdepth--;
+                                    else if (check(TokenType::RSHIFT))
+                                    {
+                                        tdepth -= 2;
+                                        consume();
+                                        continue;
+                                    }
+                                    consume();
+                                }
+                            }
                             while (check(TokenType::BIT_AND) || check(TokenType::STAR))
                                 consume();
                             // Fall through to method name parsing below
@@ -1222,6 +1303,26 @@ ASTNodePtr Parser::parseClassDecl()
                         else
                         {
                             typeToken = consume().value; // eat type name
+                            // Skip template args on field type too
+                            if (check(TokenType::LT))
+                            {
+                                consume(); // eat '<'
+                                int tdepth = 1;
+                                while (!atEnd() && tdepth > 0)
+                                {
+                                    if (check(TokenType::LT))
+                                        tdepth++;
+                                    else if (check(TokenType::GT))
+                                        tdepth--;
+                                    else if (check(TokenType::RSHIFT))
+                                    {
+                                        tdepth -= 2;
+                                        consume();
+                                        continue;
+                                    }
+                                    consume();
+                                }
+                            }
                             while (check(TokenType::BIT_AND) || check(TokenType::STAR))
                                 consume();
                             isMemberVar = true;
@@ -1643,11 +1744,52 @@ ASTNodePtr Parser::parseForStmt()
                     ++la;
                 if (la < tokens.size() && tokens[la].type == TokenType::IDENTIFIER)
                 {
+                    // ── C++ range-based for: for (int v : container) ─────────────────
+                    // Detect by peeking past the variable name for a bare COLON (not ::)
+                    size_t la2 = la + 1;
+                    // Skip pointer/ref qualifiers between type and name: int* v, int& v
+                    while (la < tokens.size() &&
+                           (tokens[la].type == TokenType::STAR ||
+                            tokens[la].type == TokenType::BIT_AND ||
+                            tokens[la].type == TokenType::CONST))
+                        la++;
+                    // Recalculate var-name position after qualifiers
+                    if (la < tokens.size() && tokens[la].type == TokenType::IDENTIFIER)
+                        la2 = la + 1;
+                    bool isRangeFor = (la2 < tokens.size() &&
+                                       tokens[la2].type == TokenType::COLON &&
+                                       (la2 + 1 >= tokens.size() ||
+                                        tokens[la2 + 1].type != TokenType::COLON)); // exclude ::
+                    if (isRangeFor)
+                    {
+                        // Consume type keyword(s) and optional qualifiers
+                        while (isCTypeKeyword(current().type))
+                            consume();
+                        while (check(TokenType::STAR) || check(TokenType::BIT_AND) || check(TokenType::CONST))
+                            consume();
+                        // Consume variable name
+                        std::string rangeVar = consume().value; // IDENTIFIER
+                        consume(); // eat ':'
+                        auto iterable = parseExpr();
+                        expect(TokenType::RPAREN, "Expected ')'");
+                        match(TokenType::COLON);
+                        skipNewlines();
+                        auto body = parseBodyOrStatement();
+                        return std::make_unique<ASTNode>(ForStmt{rangeVar, "", std::move(iterable), std::move(body)}, ln);
+                    }
+                    // ── Reset la in case the qualifier scan above advanced it ─────────
+                    la = pos + 1;
+                    while (la < tokens.size() && isCTypeKeyword(tokens[la].type))
+                        ++la;
+                    // ── Normal C-style for init: for (int i = 0; ...) ────────────────
                     auto hint = consume().value;
                     while (isCTypeKeyword(current().type))
                         hint += " " + consume().value;
 
                     auto firstDecl = parseCTypeVarDecl(hint);
+                    // Eat any trailing semicolon that parseCTypeVarDecl left behind
+                    // (it no longer consumes semicolons itself — for-loop separator
+                    //  is consumed by the "while (check SEMICOLON) consume" below)
                     if (check(TokenType::COMMA))
                     {
                         auto block = std::make_unique<ASTNode>(BlockStmt{}, ln);
@@ -2153,4 +2295,3 @@ ASTNodePtr Parser::parseExprStmt()
 // ─── Expression Parsing (Pratt precedence) ───────────────────────────────────
 
 ASTNodePtr Parser::parseExpr() { return parseAssignment(); }
-
