@@ -1020,6 +1020,22 @@ int main(int argc, char *argv[])
             std::string runCmd = "node \"" + a1 + "\"";
             return system(runCmd.c_str());
         }
+        else if (a1.size() >= 3 && a1.substr(a1.size() - 3) == ".py")
+        {
+            // Python syntax check (strict CPython grammar, no Quantum extensions)
+            std::string checkCmd = "python -m py_compile \"" + a1 + "\"";
+            int result = system(checkCmd.c_str());
+
+            if (result != 0)
+            {
+                std::cerr << "[Quantum Error] Invalid Python syntax in " << a1 << "\n";
+                return result;
+            }
+
+            // Run Python
+            std::string runCmd = "python \"" + a1 + "\"";
+            return system(runCmd.c_str());
+        }
         else if (a1.size() >= 2 && a1.substr(a1.size() - 2) == ".c")
         {
             // Compile C source
@@ -1075,7 +1091,7 @@ int main(int argc, char *argv[])
         else
         {
             std::cerr << "[Error] Unsupported file type: " << a1 << "\n";
-            std::cerr << "Supported: .sa, .js, .c, .cpp\n";
+            std::cerr << "Supported: .sa, .js, .py, .c, .cpp\n";
             return 1;
         }
 #endif
@@ -1167,6 +1183,22 @@ int main(int argc, char *argv[])
         std::string runCmd = "node \"" + arg + "\"";
         return system(runCmd.c_str());
     }
+    else if (arg.size() >= 3 && arg.substr(arg.size() - 3) == ".py")
+    {
+        // Python syntax check first (strict CPython grammar, no Quantum extensions)
+        std::string checkCmd = "python -m py_compile \"" + arg + "\"";
+        int result = system(checkCmd.c_str());
+
+        if (result != 0)
+        {
+            std::cerr << "[Quantum Error] Invalid Python syntax in " << arg << "\n";
+            return result;
+        }
+
+        // If syntax is valid, run Python
+        std::string runCmd = "python \"" + arg + "\"";
+        return system(runCmd.c_str());
+    }
     else if (arg.size() >= 2 && arg.substr(arg.size() - 2) == ".c")
     {
         std::string out = arg.substr(0, arg.size() - 2) + ".exe";
@@ -1204,7 +1236,7 @@ int main(int argc, char *argv[])
     else
     {
         std::cerr << "[Error] Unsupported file type: " << arg << "\n";
-        std::cerr << "Supported: .sa, .js, .c, .cpp\n";
+        std::cerr << "Supported: .sa, .js, .py, .c, .cpp\n";
         return 1;
     }
 }

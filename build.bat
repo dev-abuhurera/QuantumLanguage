@@ -8,17 +8,6 @@ echo   qrun    hello.sa  =^>  runs directly  ^(interpret^)
 echo.
 
 rem ══════════════════════════════════════════════════════════════════════════════
-rem  CHECK WINGET (used for all auto-installs)
-rem ══════════════════════════════════════════════════════════════════════════════
-where winget >nul 2>&1
-if errorlevel 1 (
-    echo   [ERROR] winget not found.
-    echo   Please install "App Installer" from the Microsoft Store, then re-run.
-    pause
-    exit /b 1
-)
-
-rem ══════════════════════════════════════════════════════════════════════════════
 rem  STEP 1 — MSYS2  ^(provides mingw32-make, gcc, g++^)
 rem ══════════════════════════════════════════════════════════════════════════════
 set "MSYS2_ROOT="
@@ -33,6 +22,14 @@ if "!MSYS2_ROOT!"=="" (
     echo.
     set /p "INST_MSYS2=   Install MSYS2 now? [Y/N]: "
     if /i "!INST_MSYS2!"=="Y" (
+        where winget >nul 2>&1
+        if errorlevel 1 (
+            echo   [ERROR] winget not found, so MSYS2 can't be auto-installed.
+            echo   Either install "App Installer" from the Microsoft Store and re-run,
+            echo   or install MSYS2 manually from https://www.msys2.org/
+            pause
+            exit /b 1
+        )
         echo   Downloading and installing MSYS2 via winget...
         winget install --id MSYS2.MSYS2 --silent --accept-package-agreements --accept-source-agreements
         if errorlevel 1 (
