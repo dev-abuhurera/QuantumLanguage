@@ -1,5 +1,4 @@
-/*
- * Quantum Language v2.0.0 — Bytecode VM
+ /* Quantum Language v2.0.0 — Bytecode VM
  *
  * Build defines (set by CMakeLists.txt):
  *   QUANTUM_MODE_COMPILER  → quantum.exe      (compiles .sa → .exe, then runs it)
@@ -171,7 +170,7 @@ static std::shared_ptr<Chunk> compileSource(const std::string &source,
 }
 
 // ─── Dialect support ──────────────────────────────────────────────────────────
-// .js / .py / .c / .cpp files run natively on the Quantum VM through its
+// .js / .py / .rb / .c / .cpp files run natively on the Quantum VM through its
 // multi-syntax front-end — no node/python/gcc/g++ required.
 
 static std::string fileExtLower(const std::string &path)
@@ -185,7 +184,7 @@ static bool hasSupportedExt(const std::string &path)
 {
     std::string ext = fileExtLower(path);
     return ext == ".sa" || ext == ".js" || ext == ".py" ||
-           ext == ".c" || ext == ".cpp";
+           ext == ".rb" || ext == ".c" || ext == ".cpp";
 }
 
 // True if the source defines a function named main ("main" followed by "(",
@@ -207,13 +206,153 @@ static bool definesMainFunction(const std::string &src)
     return false;
 }
 
+// Remove leading/trailing spaces while preserving the original line indentation
+// separately. This is used only by the lightweight Ruby dialect normalizer.
+static std::string trimCopy(const std::string &value)
+{
+    size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return "";
+    size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+static bool startsWith(const std::string &value, const std::string &prefix)
+{
+    return value.size() >= prefix.size() &&
+           value.compare(0, prefix.size(), prefix) == 0;
+}
+
+// Ruby-style syntax is translated into the brace-based common syntax already
+// accepted by the Quantum lexer/parser. This intentionally implements a Ruby
+// subset; it does not embed or invoke the official Ruby interpreter.
+//
+// Supported normalizations include:
+//   puts expression       -> print(expression)
+//   print expression      -> print(expression)
+//   # comment             -> // comment
+//   if/elsif/else/end     -> brace-based conditionals
+//   unless condition      -> if (!(condition))
+//   while/until/end       -> brace-based loops
+//   def name(args)/end    -> function name(args) { ... }
+static std::string applyRubyDialect(const std::string &source)
+{
+    std::istringstream input(source);
+    std::ostringstream output;
+    std::string line;
+
+    while (std::getline(input, line))
+    {
+        size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos)
+        {
+            output << "\n";
+            continue;
+        }
+
+        std::string indentation = line.substr(0, first);
+        std::string code = trimCopy(line.substr(first));
+
+        // Full-line Ruby comments. Inline # comments are left unchanged so a
+        // # inside a string or interpolation-like text is never corrupted.
+        if (!code.empty() && code[0] == '#')
+        {
+            output << indentation << "//" << code.substr(1) << "\n";
+            continue;
+        }
+
+        // puts(...) and puts expression
+        if (startsWith(code, "puts("))
+        {
+            output << indentation << "print" << code.substr(4) << "\n";
+            continue;
+        }
+        if (startsWith(code, "puts "))
+        {
+            output << indentation << "print(" << trimCopy(code.substr(5)) << ")\n";
+            continue;
+        }
+
+        // Ruby print expression (print(...) already matches the common syntax).
+        if (startsWith(code, "print "))
+        {
+            output << indentation << "print(" << trimCopy(code.substr(6)) << ")\n";
+            continue;
+        }
+
+        if (startsWith(code, "elsif "))
+        {
+            output << indentation << "} else if ("
+                   << trimCopy(code.substr(6)) << ") {\n";
+            continue;
+        }
+        if (code == "else")
+        {
+            output << indentation << "} else {\n";
+            continue;
+        }
+        if (code == "end")
+        {
+            output << indentation << "}\n";
+            continue;
+        }
+
+        if (startsWith(code, "unless "))
+        {
+            output << indentation << "if (!("
+                   << trimCopy(code.substr(7)) << ")) {\n";
+            continue;
+        }
+        if (startsWith(code, "if "))
+        {
+            output << indentation << "if ("
+                   << trimCopy(code.substr(3)) << ") {\n";
+            continue;
+        }
+
+        if (startsWith(code, "until "))
+        {
+            output << indentation << "while (!("
+                   << trimCopy(code.substr(6)) << ")) {\n";
+            continue;
+        }
+        if (startsWith(code, "while "))
+        {
+            output << indentation << "while ("
+                   << trimCopy(code.substr(6)) << ") {\n";
+            continue;
+        }
+
+        if (startsWith(code, "def "))
+        {
+            std::string signature = trimCopy(code.substr(4));
+            output << indentation << "function " << signature << " {\n";
+            continue;
+        }
+
+        // Common Ruby literals mapped to the Quantum common representation.
+        if (code == "nil")
+            code = "null";
+
+        output << indentation << code << "\n";
+    }
+
+    return output.str();
+}
+
 // C/C++ programs only define main() — append a call so the program executes
-// after its top-level declarations load.
+// after its top-level declarations load. Ruby files are first normalized into
+// the common Quantum syntax and then use the normal compiler/VM pipeline.
 static std::string applyDialect(std::string source, const std::string &path)
 {
     std::string ext = fileExtLower(path);
+
+    if (ext == ".rb")
+        source = applyRubyDialect(source);
+
     if ((ext == ".c" || ext == ".cpp") && definesMainFunction(source))
         source += "\nmain()\n";
+
     return source;
 }
 
@@ -515,7 +654,7 @@ static TestResult testFile(const std::string &path)
 static void collectTestFiles(const fs::path &dir, std::vector<fs::path> &out)
 {
     // Any file type the compiler runs natively is testable:
-    // .sa .js .py .c .cpp — all share the same multi-syntax pipeline.
+    // .sa .js .py .rb .c .cpp — all share the same multi-syntax pipeline.
     if (!fs::exists(dir) || !fs::is_directory(dir))
         return;
     for (auto &e : fs::recursive_directory_iterator(
@@ -655,7 +794,7 @@ static int runTestExamples(const std::string &dir)
     collectTestFiles(d, files);
     if (files.empty())
     {
-        std::cout << "No testable files found (.sa .js .py .c .cpp).\n";
+        std::cout << "No testable files found (.sa .js .py .rb .c .cpp).\n";
         return 0;
     }
     std::sort(files.begin(), files.end());
@@ -797,11 +936,12 @@ static void printHelp(const char *prog)
               << "  " << prog << " --dis   <file>     Dump bytecode only\n"
               << "  " << prog << " --test  [dir]      Batch-test all supported source files\n"
               << "  qrun <file>                 Interpret directly (no .exe)\n\n"
-              << "  Supported files: .sa .js .py .c .cpp — all run natively on the\n"
+              << "  Supported files: .sa .js .py .rb .c .cpp — all run natively on the\n"
               << "  Quantum VM (multi-syntax subset; node/python/gcc NOT required)\n\n"
               << "  quantum hello.sa            → hello.exe created and run\n"
               << "  quantum prog.c              → prog.exe created and run (no gcc)\n"
-              << "  qrun    hello.py            → interpreted directly\n";
+              << "  qrun    hello.py            → interpreted directly\n"
+              << "  qrun    hello.rb            → Ruby-style subset interpreted directly\n";
 }
 
 // ─── findStubPath ─────────────────────────────────────────────────────────────
@@ -835,7 +975,7 @@ static std::string findStubPath(const std::string &quantumExePath)
 }
 
 // ─── bundleAndRun ─────────────────────────────────────────────────────────────
-// Compiles a source file (.sa/.js/.py/.c/.cpp) → bytecode, appends it to a
+// Compiles a source file (.sa/.js/.py/.rb/.c/.cpp) → bytecode, appends it to a
 // copy of quantum_stub.exe, writes <name>.exe next to the source file,
 // then launches it and waits.
 
@@ -1051,7 +1191,7 @@ int main(int argc, char *argv[])
     if (a1 == "--test")
         return runTestExamples(argc >= 3 ? argv[2] : "examples");
     // Any supported source file runs natively on the Quantum VM —
-    // .js/.py/.c/.cpp go through the same multi-syntax front-end as .sa,
+    // .js/.py/.rb/.c/.cpp go through the same multi-syntax front-end as .sa,
     // so no node/python/gcc/g++ is required.
     if (hasSupportedExt(a1))
     {
@@ -1061,7 +1201,7 @@ int main(int argc, char *argv[])
     else
     {
         std::cerr << "[Error] Unsupported file type: " << a1 << "\n";
-        std::cerr << "Supported: .sa, .js, .py, .c, .cpp (run natively on the Quantum VM)\n";
+        std::cerr << "Supported: .sa, .js, .py, .rb, .c, .cpp (run natively on the Quantum VM)\n";
         return 1;
     }
 #endif
@@ -1131,12 +1271,12 @@ int main(int argc, char *argv[])
     }
 
     // Default: compile any supported source file → <file>.exe → run.
-    // .js/.py/.c/.cpp compile through the same multi-syntax front-end as .sa,
+    // .js/.py/.rb/.c/.cpp compile through the same multi-syntax front-end as .sa,
     // so no node/python/gcc/g++ is required and the produced .exe is standalone.
     if (hasSupportedExt(arg))
         return bundleAndRun(arg, exePath);
 
     std::cerr << "[Error] Unsupported file type: " << arg << "\n";
-    std::cerr << "Supported: .sa, .js, .py, .c, .cpp (run natively on the Quantum VM)\n";
+    std::cerr << "Supported: .sa, .js, .py, .rb, .c, .cpp (run natively on the Quantum VM)\n";
     return 1;
 }
