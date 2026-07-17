@@ -55,6 +55,50 @@ ASTNodePtr Parser::parsePrimary()
         return std::make_unique<ASTNode>(Identifier{"self"}, ln);
     }
 
+    // Python lambda: lambda x, y: expr
+    // Only when a ':' follows on the same line — otherwise "lambda" stays a
+    // plain identifier so variables named lambda keep working.
+    if (tok.type == TokenType::IDENTIFIER && tok.value == "lambda")
+    {
+        size_t la = pos + 1;
+        bool sawColon = false;
+        while (la < tokens.size() && tokens[la].type != TokenType::NEWLINE &&
+               tokens[la].type != TokenType::EOF_TOKEN)
+        {
+            if (tokens[la].type == TokenType::COLON)
+            {
+                sawColon = true;
+                break;
+            }
+            if (tokens[la].type != TokenType::IDENTIFIER &&
+                tokens[la].type != TokenType::COMMA)
+                break; // params can only be names and commas
+            la++;
+        }
+        if (sawColon)
+        {
+            consume(); // eat 'lambda'
+            std::vector<std::string> params;
+            while (!check(TokenType::COLON) && !atEnd())
+            {
+                if (check(TokenType::IDENTIFIER))
+                    params.push_back(consume().value);
+                else if (!match(TokenType::COMMA))
+                    break;
+            }
+            expect(TokenType::COLON, "Expected ':' in lambda");
+            auto bodyExpr = parseAssignment(); // single expression body
+            int eln = bodyExpr->line;
+            auto retStmt = std::make_unique<ASTNode>(ReturnStmt{std::move(bodyExpr)}, eln);
+            BlockStmt block;
+            block.statements.push_back(std::move(retStmt));
+            LambdaExpr le;
+            le.params = std::move(params);
+            le.body = std::make_unique<ASTNode>(std::move(block), ln);
+            return std::make_unique<ASTNode>(std::move(le), ln);
+        }
+    }
+
     // new int(100) / new ClassName(args) / new int[n]
     if (tok.type == TokenType::NEW)
     {
@@ -86,6 +130,25 @@ ASTNodePtr Parser::parsePrimary()
             return std::make_unique<ASTNode>(std::move(ne), ln);
         }
 
+        // new Node{val, nullptr} — C++ brace-initializer constructor arguments
+        if (check(TokenType::LBRACE))
+        {
+            consume(); // eat '{'
+            skipNewlines();
+            NewExpr ne;
+            ne.typeName = name;
+            while (!check(TokenType::RBRACE) && !atEnd())
+            {
+                ne.args.push_back(parseExpr());
+                skipNewlines();
+                if (!match(TokenType::COMMA))
+                    break;
+                skipNewlines();
+            }
+            expect(TokenType::RBRACE, "Expected '}'");
+            return std::make_unique<ASTNode>(std::move(ne), ln);
+        }
+
         // new int(100) / new ClassName(args) — heap allocation, always returns a pointer
         auto argNodes = parseArgList();
         NewExpr ne;
@@ -110,7 +173,54 @@ ASTNodePtr Parser::parsePrimary()
     }
 
     if (tok.type == TokenType::LBRACKET)
+    {
+        // C++ lambda: [captures](params) { body }
+        // Detect by scanning: matching ']' then '(' ... ')' then '{'.
+        // The capture list is discarded — Quantum closures capture automatically.
+        size_t la = pos + 1;
+        int bdepth = 1;
+        while (la < tokens.size() && bdepth > 0)
+        {
+            if (tokens[la].type == TokenType::LBRACKET)
+                bdepth++;
+            else if (tokens[la].type == TokenType::RBRACKET)
+                bdepth--;
+            la++;
+        }
+        if (bdepth == 0 && la < tokens.size() && tokens[la].type == TokenType::LPAREN)
+        {
+            size_t la2 = la + 1;
+            int pdepth = 1;
+            while (la2 < tokens.size() && pdepth > 0)
+            {
+                if (tokens[la2].type == TokenType::LPAREN)
+                    pdepth++;
+                else if (tokens[la2].type == TokenType::RPAREN)
+                    pdepth--;
+                la2++;
+            }
+            while (la2 < tokens.size() && tokens[la2].type == TokenType::NEWLINE)
+                la2++;
+            if (pdepth == 0 && la2 < tokens.size() && tokens[la2].type == TokenType::LBRACE)
+            {
+                int ln2 = tok.line;
+                while (pos < la)
+                    consume(); // discard '[captures]'
+                std::vector<ASTNodePtr> defaultArgs;
+                std::vector<std::string> paramTypes;
+                auto params = parseParamList(nullptr, &defaultArgs, &paramTypes);
+                skipNewlines();
+                auto body = parseBlock();
+                LambdaExpr le;
+                le.params = std::move(params);
+                le.paramTypes = std::move(paramTypes);
+                le.defaultArgs = std::move(defaultArgs);
+                le.body = std::move(body);
+                return std::make_unique<ASTNode>(std::move(le), ln2);
+            }
+        }
         return parseArrayLiteral();
+    }
     if (tok.type == TokenType::LBRACE)
         return parseDictLiteral();
 
@@ -432,17 +542,18 @@ ASTNodePtr Parser::parsePrimary()
         auto name = tok.value;
         consume();
 
+        // Glue C++ scope access into the identifier: Class::member.
+        // Only when '::' is followed by an identifier — otherwise leave the
+        // colons alone so Python slices like a[i::2] still parse.
         while (check(TokenType::COLON))
         {
             size_t la = pos + 1;
-            if (la < tokens.size() && tokens[la].type == TokenType::COLON)
+            if (la + 1 < tokens.size() && tokens[la].type == TokenType::COLON &&
+                tokens[la + 1].type == TokenType::IDENTIFIER)
             {
                 consume(); // colon
                 consume(); // colon
-                if (check(TokenType::IDENTIFIER))
-                {
-                    name += "::" + consume().value;
-                }
+                name += "::" + consume().value;
             }
             else
             {
@@ -462,14 +573,12 @@ ASTNodePtr Parser::parsePrimary()
         while (check(TokenType::COLON))
         {
             size_t la = pos + 1;
-            if (la < tokens.size() && tokens[la].type == TokenType::COLON)
+            if (la + 1 < tokens.size() && tokens[la].type == TokenType::COLON &&
+                tokens[la + 1].type == TokenType::IDENTIFIER)
             {
                 consume(); // colon
                 consume(); // colon
-                if (check(TokenType::IDENTIFIER))
-                {
-                    name += "::" + consume().value;
-                }
+                name += "::" + consume().value;
             }
             else
             {
@@ -583,6 +692,40 @@ ASTNodePtr Parser::parseDictLiteral()
     int ln = current().line;
     expect(TokenType::LBRACE, "Expected '{'");
     skipNewlines();
+
+    // C++ brace-initializer list: {"apple", "banana"}, {1, 2, 3}, or nested
+    // {{"a", x}, {"b", y}} — a literal first element followed by ',' or '}'
+    // (or an immediately nested '{') can't be a dict; parse as an array.
+    bool braceInitList = false;
+    if (check(TokenType::LBRACE))
+        braceInitList = true; // nested init list → array of arrays
+    else if (check(TokenType::STRING) || check(TokenType::NUMBER))
+    {
+        size_t la = pos + 1;
+        while (la < tokens.size() && tokens[la].type == TokenType::NEWLINE)
+            la++;
+        if (la < tokens.size() && (tokens[la].type == TokenType::COMMA ||
+                                   tokens[la].type == TokenType::RBRACE))
+            braceInitList = true;
+    }
+    {
+        if (braceInitList)
+        {
+            ArrayLiteral arr;
+            while (!check(TokenType::RBRACE) && !atEnd())
+            {
+                arr.elements.push_back(parseExpr());
+                skipNewlines();
+                if (!match(TokenType::COMMA))
+                    break;
+                skipNewlines();
+            }
+            skipNewlines();
+            expect(TokenType::RBRACE, "Expected '}'");
+            return std::make_unique<ASTNode>(std::move(arr), ln);
+        }
+    }
+
     DictLiteral dict;
     while (!check(TokenType::RBRACE) && !atEnd())
     {
@@ -844,13 +987,17 @@ std::vector<std::string> Parser::parseParamList(std::vector<bool> *outIsRef, std
                     {
                         tdepth--;
                         la++;
-                        break;
+                        if (tdepth <= 0)
+                            break;
+                        continue;
                     }
                     else if (tokens[la].type == TokenType::RSHIFT)
                     {
                         tdepth -= 2;
                         la++;
-                        break;
+                        if (tdepth <= 0)
+                            break;
+                        continue;
                     }
                     la++;
                 }
@@ -1099,10 +1246,22 @@ ASTNodePtr Parser::parseCTypeVarDecl(const std::string &typeHint)
 
     // Skip C array dimension brackets: char map[ROWS][COLS], int arr[N], etc.
     bool isArray = false;
+    std::vector<ASTNodePtr> arrayDims;
     while (check(TokenType::LBRACKET))
     {
         isArray = true;
         consume(); // eat '['
+        // Capture the dimension expression so "int arr[N]" can allocate
+        if (!check(TokenType::RBRACKET))
+        {
+            try
+            {
+                arrayDims.push_back(parseExpr());
+            }
+            catch (...)
+            {
+            }
+        }
         int bdepth = 1;
         while (!atEnd() && bdepth > 0)
         {
@@ -1118,7 +1277,34 @@ ASTNodePtr Parser::parseCTypeVarDecl(const std::string &typeHint)
         finalTypeHint += "[]";
     ASTNodePtr init;
     if (match(TokenType::ASSIGN))
+    {
         init = parseExpr();
+        // C aggregate zero-init: int m[10][10] = {0}; — "{0}" means
+        // "zero-fill the whole array", not a one-element array.
+        bool zeroFillIdiom = false;
+        if (!arrayDims.empty() && init && init->is<ArrayLiteral>())
+        {
+            auto &els = init->as<ArrayLiteral>().elements;
+            zeroFillIdiom = els.empty() ||
+                            (els.size() == 1 && els[0]->is<NumberLiteral>() &&
+                             els[0]->as<NumberLiteral>().value == 0.0);
+        }
+        if (zeroFillIdiom)
+        {
+            CallExpr mk;
+            mk.callee = std::make_unique<ASTNode>(Identifier{"__c_array__"}, ln);
+            mk.args = std::move(arrayDims);
+            init = std::make_unique<ASTNode>(std::move(mk), ln);
+        }
+    }
+    else if (!arrayDims.empty())
+    {
+        // int arr[10] / char grid[R][C] — allocate a zero-filled (nested) array
+        CallExpr mk;
+        mk.callee = std::make_unique<ASTNode>(Identifier{"__c_array__"}, ln);
+        mk.args = std::move(arrayDims);
+        init = std::make_unique<ASTNode>(std::move(mk), ln);
+    }
     auto decl = VarDecl{false, nameToken.value, std::move(init), finalTypeHint};
     decl.isPointer = isPointer;
     auto node = std::make_unique<ASTNode>(std::move(decl), ln);

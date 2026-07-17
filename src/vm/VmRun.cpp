@@ -7,6 +7,14 @@
 
 void VM::runFrame(size_t stopDepth)
 {
+    // Outer retry loop: a QuantumError thrown by any opcode (division by
+    // zero, calling nil, bad index, ...) is routed to the innermost active
+    // try/catch handler exactly like an explicit RAISE would be. Without a
+    // handler at or above stopDepth the error propagates to the caller.
+    while (frames_.size() > stopDepth)
+    {
+        try
+        {
     while (frames_.size() > stopDepth)
     {
         CallFrame &frame = frames_.back();
@@ -314,6 +322,12 @@ void VM::runFrame(size_t stopDepth)
         {
             int argCount = instr.operand;
             QuantumValue callee = stack_[stack_.size() - argCount - 1];
+
+            // C++ dialect tolerance: properties like .size/.length yield a
+            // number directly, so "v.size()" ends up calling that number —
+            // a zero-arg call on a number is the number itself.
+            if (callee.isNumber() && argCount == 0)
+                break; // callee stays on the stack as the result
 
             if (callee.isNative())
             {
@@ -665,6 +679,18 @@ void VM::runFrame(size_t stopDepth)
                 if (obj.isDict())
                 {
                     push(QuantumValue((double)obj.asDict()->size()));
+                    break;
+                }
+            }
+
+            // C++ pair emulation: {a, b}.first / .second → arr[0] / arr[1]
+            if (obj.isArray() && (name == "first" || name == "second"))
+            {
+                auto &a = *obj.asArray();
+                size_t idx = (name == "first") ? 0 : 1;
+                if (idx < a.size())
+                {
+                    push(a[idx]);
                     break;
                 }
             }
@@ -1031,6 +1057,24 @@ void VM::runFrame(size_t stopDepth)
                                line);
         } // switch
     } // while frames
+        }
+        catch (QuantumError &e)
+        {
+            // A handler below stopDepth belongs to an outer runFrame
+            // invocation — rethrow so the C++ stack unwinds through it.
+            if (handlers_.empty() || handlers_.back().frameDepth < stopDepth)
+                throw;
+            ExceptionHandler h = handlers_.back();
+            handlers_.pop_back();
+            while (frames_.size() > h.frameDepth)
+                frames_.pop_back();
+            while (stack_.size() > h.stackDepth)
+                stack_.pop_back();
+            push(QuantumValue(std::string(e.what())));
+            if (!frames_.empty())
+                frames_.back().ip = h.catchIp;
+        }
+    }
 }
 
 // ─── Register natives (same set as the old Interpreter) ──────────────────────

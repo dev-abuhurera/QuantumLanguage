@@ -68,6 +68,16 @@ static std::string defaultTestInput(const std::vector<QuantumValue> &args)
     if (lower.find("choice") != std::string::npos)
         return "9";
 
+    // "Enter ... (or 'q' to quit)" — return the quit token so retry loops
+    // terminate instead of hitting the step limit under --test.
+    if (lower.find("quit") != std::string::npos || lower.find("exit") != std::string::npos)
+    {
+        std::smatch qm;
+        if (std::regex_search(lower, qm, std::regex(R"('([^']+)')")))
+            return qm[1].str();
+        return "q";
+    }
+
     return "";
 }
 
@@ -82,6 +92,11 @@ static QuantumValue defaultTestInputValue(const std::vector<QuantumValue> &args,
             return QuantumValue(0.0);
         if (prompt.find("%c") != std::string::npos)
             return QuantumValue(std::string("?"));
+        // Prompt-less reads (cin >> x) — default to 1 so arithmetic on the
+        // value works and divisions/modulo don't hit zero; Python-style
+        // input() keeps returning a string.
+        if (prompt.empty())
+            return QuantumValue(1.0);
     }
     return QuantumValue(defaultTestInput(args));
 }
@@ -302,17 +317,55 @@ void VM::registerNatives()
         { return QuantumValue(std::atan(toNum2(a[0], "atan"))); });
     reg("atan2", [](std::vector<QuantumValue> a) -> QuantumValue
         { return QuantumValue(std::atan2(toNum2(a[0], "atan2"), toNum2(a[1], "atan2"))); });
-    reg("min", [](std::vector<QuantumValue> a) -> QuantumValue
+    // Shared by min/max: call a key function (Python max(xs, key=fn) style)
+    auto callKeyFn = [this](QuantumValue fn, QuantumValue arg) -> QuantumValue
+    {
+        if (fn.isNative())
+            return fn.asNative()->fn({arg});
+        if (fn.isFunction())
+        {
+            push(fn);
+            push(arg);
+            callClosure(fn.asFunction(), 1, 0);
+            runFrame(frames_.size() - 1);
+            return pop();
+        }
+        throw TypeError("min/max key= is not callable");
+    };
+    auto minmaxWithKey = [callKeyFn](std::vector<QuantumValue> &a, bool wantMax,
+                                     const char *name) -> QuantumValue
+    {
+        auto &arr = *a[0].asArray();
+        if (arr.empty())
+            throw RuntimeError(std::string(name) + "(): empty");
+        QuantumValue best = arr[0];
+        double bestKey = toNum2(callKeyFn(a[1], arr[0]), name);
+        for (size_t i = 1; i < arr.size(); i++)
+        {
+            double k = toNum2(callKeyFn(a[1], arr[i]), name);
+            if (wantMax ? (k > bestKey) : (k < bestKey))
+            {
+                bestKey = k;
+                best = arr[i];
+            }
+        }
+        return best;
+    };
+    reg("min", [minmaxWithKey](std::vector<QuantumValue> a) -> QuantumValue
         {
         if (a.empty()) throw RuntimeError("min() expected args");
+        if (a.size()>=2 && a[0].isArray() && (a[1].isFunction() || a[1].isNative()))
+            return minmaxWithKey(a, false, "min");
         if (a.size()==1 && a[0].isArray()) {
             auto &arr=*a[0].asArray(); if(arr.empty()) throw RuntimeError("min(): empty");
             double m=toNum2(arr[0],"min"); for(size_t i=1;i<arr.size();i++) m=std::min(m,toNum2(arr[i],"min")); return QuantumValue(m);
         }
         double m=toNum2(a[0],"min"); for(size_t i=1;i<a.size();i++) m=std::min(m,toNum2(a[i],"min")); return QuantumValue(m); });
-    reg("max", [](std::vector<QuantumValue> a) -> QuantumValue
+    reg("max", [minmaxWithKey](std::vector<QuantumValue> a) -> QuantumValue
         {
         if (a.empty()) throw RuntimeError("max() expected args");
+        if (a.size()>=2 && a[0].isArray() && (a[1].isFunction() || a[1].isNative()))
+            return minmaxWithKey(a, true, "max");
         if (a.size()==1 && a[0].isArray()) {
             auto &arr=*a[0].asArray(); if(arr.empty()) throw RuntimeError("max(): empty");
             double m=toNum2(arr[0],"max"); for(size_t i=1;i<arr.size();i++) m=std::max(m,toNum2(arr[i],"max")); return QuantumValue(m);
@@ -2035,6 +2088,167 @@ void VM::registerNatives()
     }
 
     globals->define("console", QuantumValue(consoleDict));
+
+    // ── numeric_limits object (C++ compatibility) ─────────────────────────
+    // numeric_limits<T>::max() parses down to numeric_limits.max() — the
+    // template argument is erased, so all specializations share one object.
+    {
+        auto nlDict = std::make_shared<Dict>();
+        auto makeNlMethod = [&](const std::string &name, double value)
+        {
+            auto nat = std::make_shared<QuantumNative>();
+            nat->name = "numeric_limits." + name;
+            nat->fn = [value](std::vector<QuantumValue>) -> QuantumValue
+            { return QuantumValue(value); };
+            (*nlDict)[name] = QuantumValue(nat);
+        };
+        makeNlMethod("max", std::numeric_limits<double>::max());
+        makeNlMethod("min", std::numeric_limits<double>::lowest());
+        makeNlMethod("lowest", std::numeric_limits<double>::lowest());
+        makeNlMethod("epsilon", std::numeric_limits<double>::epsilon());
+        makeNlMethod("infinity", std::numeric_limits<double>::infinity());
+        globals->define("numeric_limits", QuantumValue(nlDict));
+    }
+
+    // ── C/C++ standard-library compatibility ──────────────────────────────
+
+    // __c_array__(d1, d2, ...) — nested zero-filled array for "int arr[N];"
+    // declarations (emitted by the parser when a C array has no initializer).
+    reg("__c_array__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        std::function<QuantumValue(size_t)> build = [&](size_t d) -> QuantumValue
+        {
+            int n = (d < args.size() && args[d].isNumber()) ? (int)args[d].asNumber() : 0;
+            if (n < 0) n = 0;
+            auto arr = std::make_shared<Array>();
+            arr->reserve((size_t)n);
+            for (int i = 0; i < n; ++i)
+                arr->push_back(d + 1 < args.size() ? build(d + 1) : QuantumValue(0.0));
+            return QuantumValue(arr);
+        };
+        return build(0); });
+
+    reg("to_string", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.empty()) return QuantumValue(std::string(""));
+        return QuantumValue(args[0].toString()); });
+
+    // <cctype> character classification — accepts a 1-char string or char code
+    auto firstChar = [](const std::vector<QuantumValue> &args) -> int
+    {
+        if (args.empty())
+            return -1;
+        if (args[0].isNumber())
+            return (int)args[0].asNumber();
+        std::string s = args[0].toString();
+        return s.empty() ? -1 : (unsigned char)s[0];
+    };
+    reg("isalpha", [firstChar](std::vector<QuantumValue> a) -> QuantumValue
+        { int c = firstChar(a); return QuantumValue(c >= 0 && std::isalpha(c) != 0); });
+    reg("isdigit", [firstChar](std::vector<QuantumValue> a) -> QuantumValue
+        { int c = firstChar(a); return QuantumValue(c >= 0 && std::isdigit(c) != 0); });
+    reg("isalnum", [firstChar](std::vector<QuantumValue> a) -> QuantumValue
+        { int c = firstChar(a); return QuantumValue(c >= 0 && std::isalnum(c) != 0); });
+    reg("isspace", [firstChar](std::vector<QuantumValue> a) -> QuantumValue
+        { int c = firstChar(a); return QuantumValue(c >= 0 && std::isspace(c) != 0); });
+    reg("isupper", [firstChar](std::vector<QuantumValue> a) -> QuantumValue
+        { int c = firstChar(a); return QuantumValue(c >= 0 && std::isupper(c) != 0); });
+    reg("islower", [firstChar](std::vector<QuantumValue> a) -> QuantumValue
+        { int c = firstChar(a); return QuantumValue(c >= 0 && std::islower(c) != 0); });
+    reg("toupper", [](std::vector<QuantumValue> a) -> QuantumValue
+        {
+        if (a.empty()) return QuantumValue(std::string(""));
+        std::string s = a[0].toString();
+        std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+        return QuantumValue(s); });
+    reg("tolower", [](std::vector<QuantumValue> a) -> QuantumValue
+        {
+        if (a.empty()) return QuantumValue(std::string(""));
+        std::string s = a[0].toString();
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        return QuantumValue(s); });
+
+    // <cstring> — value semantics only (strcpy cannot mutate its destination;
+    // it returns the source so "dst = strcpy(dst, src)" works)
+    reg("strlen", [](std::vector<QuantumValue> a) -> QuantumValue
+        {
+        if (a.empty() || a[0].isNil()) return QuantumValue(0.0);
+        return QuantumValue((double)a[0].toString().size()); });
+    reg("strcpy", [](std::vector<QuantumValue> a) -> QuantumValue
+        { return a.size() > 1 ? a[1] : QuantumValue(std::string("")); });
+    reg("strcat", [](std::vector<QuantumValue> a) -> QuantumValue
+        {
+        std::string r;
+        for (auto &v : a) if (!v.isNil()) r += v.toString();
+        return QuantumValue(r); });
+    reg("strcmp", [](std::vector<QuantumValue> a) -> QuantumValue
+        {
+        std::string x = a.size() > 0 ? a[0].toString() : "";
+        std::string y = a.size() > 1 ? a[1].toString() : "";
+        return QuantumValue((double)(x < y ? -1 : (x > y ? 1 : 0))); });
+
+    // getline(cin, s) — reads a line; assignment to s is by value only, so the
+    // return value is what callers should use. In --test mode returns "".
+    reg("getline", [](std::vector<QuantumValue>) -> QuantumValue
+        {
+        if (g_testMode) return QuantumValue(std::string(""));
+        std::string line;
+        std::getline(std::cin, line);
+        return QuantumValue(line); });
+
+    // reverse(a.begin(), a.end()) — arrays reverse in place; strings return
+    // a reversed copy (strings are immutable values here).
+    reg("reverse", [](std::vector<QuantumValue> a) -> QuantumValue
+        {
+        if (!a.empty() && a[0].isArray())
+        {
+            auto arr = a[0].asArray();
+            std::reverse(arr->begin(), arr->end());
+            return a[0];
+        }
+        if (!a.empty() && a[0].isString())
+        {
+            std::string s = a[0].toString();
+            std::reverse(s.begin(), s.end());
+            return QuantumValue(s);
+        }
+        return QuantumValue(); });
+
+    // STL container constructors — maps become dicts, sequences become arrays.
+    // "map<string,int> m;" parses to "m = map()" via the default-ctor path.
+    for (const char *dictLike : {"map", "unordered_map", "multimap"})
+        reg(dictLike, [](std::vector<QuantumValue>) -> QuantumValue
+            { return QuantumValue(std::make_shared<Dict>()); });
+    for (const char *arrLike : {"vector", "stack", "queue", "deque", "priority_queue"})
+        reg(arrLike, [](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            // vector(n) / vector(n, fill) — sized construction
+            auto arr = std::make_shared<Array>();
+            if (!a.empty() && a[0].isNumber())
+            {
+                int n = (int)a[0].asNumber();
+                QuantumValue fill = a.size() > 1 ? a[1] : QuantumValue(0.0);
+                for (int i = 0; i < n; ++i)
+                    arr->push_back(fill);
+            }
+            return QuantumValue(arr); });
+
+    // Python repr()
+    reg("repr", [](std::vector<QuantumValue> a) -> QuantumValue
+        {
+        if (a.empty()) return QuantumValue(std::string(""));
+        if (a[0].isString()) return QuantumValue("'" + a[0].toString() + "'");
+        return QuantumValue(a[0].toString()); });
+
+    // <stdexcept> constructors — exceptions travel as message strings, and
+    // the string method .what() returns the string itself.
+    for (const char *excName : {"exception", "runtime_error", "logic_error",
+                                "invalid_argument", "out_of_range", "domain_error",
+                                "length_error", "overflow_error", "underflow_error"})
+    {
+        reg(excName, [](std::vector<QuantumValue> a) -> QuantumValue
+            { return QuantumValue(a.empty() ? std::string("error") : a[0].toString()); });
+    }
 
     // ── Crypto / Hashing ─────────────────────────────────────────────────
 

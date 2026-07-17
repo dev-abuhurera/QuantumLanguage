@@ -14,6 +14,48 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
 {
     if (m == "length" || m == "size")
         return QuantumValue((double)str.size());
+    // C++ compatibility: e.what() on caught exception strings; s.begin()/s.end()
+    // for iterator-style calls like reverse(s.begin(), s.end()).
+    if (m == "what" || m == "begin" || m == "end")
+        return QuantumValue(str);
+    // Python str.is*() classification methods
+    if (m == "isalnum" || m == "isalpha" || m == "isdigit" || m == "isnumeric" ||
+        m == "isspace" || m == "isupper" || m == "islower")
+    {
+        if (str.empty())
+            return QuantumValue(false);
+        for (unsigned char c : str)
+        {
+            bool ok = (m == "isalnum")   ? std::isalnum(c) != 0
+                      : (m == "isalpha") ? std::isalpha(c) != 0
+                      : (m == "isspace") ? std::isspace(c) != 0
+                      : (m == "isupper") ? std::isupper(c) != 0
+                      : (m == "islower") ? std::islower(c) != 0
+                                         : std::isdigit(c) != 0; // isdigit/isnumeric
+            if (!ok)
+                return QuantumValue(false);
+        }
+        return QuantumValue(true);
+    }
+    if (m == "capitalize")
+    {
+        std::string r = str;
+        std::transform(r.begin(), r.end(), r.begin(), ::tolower);
+        if (!r.empty())
+            r[0] = (char)::toupper((unsigned char)r[0]);
+        return QuantumValue(r);
+    }
+    if (m == "title")
+    {
+        std::string r = str;
+        bool newWord = true;
+        for (auto &c : r)
+        {
+            c = newWord ? (char)::toupper((unsigned char)c) : (char)::tolower((unsigned char)c);
+            newWord = std::isalpha((unsigned char)c) == 0;
+        }
+        return QuantumValue(r);
+    }
     if (m == "toUpperCase" || m == "upper")
     {
         std::string r = str;

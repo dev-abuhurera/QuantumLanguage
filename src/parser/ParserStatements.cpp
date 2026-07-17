@@ -89,6 +89,15 @@ ASTNodePtr Parser::parseStatement()
                 consume();
             return block;
         }
+        // C++ style: "const vector<K>& keys = ..." / "const Node* p = ..."
+        // const followed by a class-type name — drop the const qualifier and
+        // let the identifier-declaration path handle the rest.
+        if (check(TokenType::IDENTIFIER) && pos + 1 < tokens.size() &&
+            (tokens[pos + 1].type == TokenType::LT ||
+             tokens[pos + 1].type == TokenType::IDENTIFIER ||
+             tokens[pos + 1].type == TokenType::STAR ||
+             tokens[pos + 1].type == TokenType::BIT_AND))
+            return parseStatement();
         // Quantum/JS style: "const x = 5"
         return parseVarDecl(true);
     }
@@ -221,10 +230,19 @@ ASTNodePtr Parser::parseStatement()
             {
                 // skip optional '(' around type list
                 match(TokenType::LPAREN);
+                // C++: catch (const exception& e) — strip const, take the type
+                if (check(TokenType::CONST))
+                    consume();
                 if (check(TokenType::IDENTIFIER))
                     clause.errorType = consume().value;
                 else if (isCTypeKeyword(current().type))
                     clause.errorType = consume().value;
+                // C++ reference/pointer qualifiers, then the binding name
+                while (check(TokenType::BIT_AND) || check(TokenType::STAR))
+                    consume();
+                if (check(TokenType::IDENTIFIER) && clause.alias.empty() &&
+                    current().value != "as")
+                    clause.alias = consume().value;
                 // skip extra types: except (A, B) — just use first
                 while (check(TokenType::COMMA))
                 {
@@ -245,6 +263,22 @@ ASTNodePtr Parser::parseStatement()
             skipNewlines();
             clause.body = parseBlock();
             ts.handlers.push_back(std::move(clause));
+            skipNewlines();
+        }
+        // Python try/except/else — else runs only when no exception was
+        // raised; appending it to the try body gives exactly that behaviour.
+        if (check(TokenType::ELSE))
+        {
+            consume();
+            match(TokenType::COLON);
+            skipNewlines();
+            auto elseBody = parseBlock();
+            if (ts.body && ts.body->is<BlockStmt>() && elseBody->is<BlockStmt>())
+            {
+                auto &dst = ts.body->as<BlockStmt>().statements;
+                for (auto &st : elseBody->as<BlockStmt>().statements)
+                    dst.push_back(std::move(st));
+            }
             skipNewlines();
         }
         // Optional finally
@@ -384,6 +418,50 @@ ASTNodePtr Parser::parseStatement()
                 consume();
             // Return an empty block as a no-op
             return std::make_unique<ASTNode>(BlockStmt{}, ln);
+        }
+        // C/C++/JS switch statement — desugared to an if-chain with C
+        // fallthrough semantics inside a breakable loop.
+        if (check(TokenType::IDENTIFIER) && current().value == "switch" &&
+            pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LPAREN)
+            return parseSwitchStmt();
+
+        // Handle C++ "template<typename T, ...>" prefix as a no-op — skip the
+        // angle-bracket list so the class/function that follows parses normally
+        // (Quantum is dynamically typed, so the type parameters are irrelevant).
+        if (check(TokenType::IDENTIFIER) && current().value == "template" &&
+            pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LT)
+        {
+            consume(); // eat 'template'
+            consume(); // eat '<'
+            int tdepth = 1;
+            while (!atEnd() && tdepth > 0)
+            {
+                if (check(TokenType::LT))
+                    tdepth++;
+                else if (check(TokenType::GT))
+                    tdepth--;
+                else if (check(TokenType::RSHIFT))
+                    tdepth -= 2;
+                consume();
+            }
+            skipNewlines();
+            return parseStatement();
+        }
+        // Handle C++ "struct Name { ... };" / "union Name { ... };" as a class
+        // declaration — fields, constructors (incl. initializer lists), and
+        // methods all go through parseClassDecl.
+        if (check(TokenType::IDENTIFIER) &&
+            (current().value == "struct" || current().value == "union") &&
+            pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::IDENTIFIER)
+        {
+            size_t laS = pos + 2;
+            while (laS < tokens.size() && tokens[laS].type == TokenType::NEWLINE)
+                laS++;
+            if (laS < tokens.size() && tokens[laS].type == TokenType::LBRACE)
+            {
+                consume(); // eat 'struct' / 'union'
+                return parseClassDecl();
+            }
         }
         // Handle GCC/Clang __asm__ volatile (...) — skip as a no-op
         if (check(TokenType::IDENTIFIER) && (current().value == "__asm__" || current().value == "asm"))
@@ -577,13 +655,17 @@ ASTNodePtr Parser::parseStatement()
                     {
                         tdepth--;
                         laName++;
-                        break;
+                        if (tdepth <= 0)
+                            break;
+                        continue;
                     }
                     else if (tokens[laName].type == TokenType::RSHIFT)
                     {
                         tdepth -= 2;
                         laName++;
-                        break;
+                        if (tdepth <= 0)
+                            break;
+                        continue;
                     }
                     laName++;
                 }
@@ -616,6 +698,8 @@ ASTNodePtr Parser::parseStatement()
                         auto &iTok = tokens[innerPos];
                         if (isCTypeKeyword(iTok.type))
                             looksLikeFuncDecl = true;
+                        else if (iTok.type == TokenType::CONST)
+                            looksLikeFuncDecl = true; // const-qualified param → function decl
                         else if (iTok.type == TokenType::RPAREN)
                             looksLikeFuncDecl = true; // empty params → function decl
                         else if (iTok.type == TokenType::IDENTIFIER)
@@ -688,10 +772,22 @@ ASTNodePtr Parser::parseStatement()
                             consume();
                         }
                         std::string varName = expect(TokenType::IDENTIFIER, "Expected variable name").value;
-                        // Skip C array dimension brackets: board[ROWS][COLS], snake[MAX_LEN], etc.
+                        // C array dimension brackets: board[ROWS][COLS], Shape* shapes[3], etc.
+                        // Capture the sizes so the variable is allocated as an array.
+                        std::vector<ASTNodePtr> dims;
                         while (check(TokenType::LBRACKET))
                         {
                             consume(); // eat '['
+                            if (!check(TokenType::RBRACKET))
+                            {
+                                try
+                                {
+                                    dims.push_back(parseExpr());
+                                }
+                                catch (...)
+                                {
+                                }
+                            }
                             int depth = 1;
                             while (!atEnd() && depth > 0)
                             {
@@ -703,7 +799,15 @@ ASTNodePtr Parser::parseStatement()
                             }
                         }
                         ASTNodePtr init;
-                        if (check(TokenType::LPAREN))
+                        if (!dims.empty() && !check(TokenType::ASSIGN))
+                        {
+                            // Type name[N]; — zero-filled array, NOT a constructor call
+                            CallExpr mk;
+                            mk.callee = std::make_unique<ASTNode>(Identifier{"__c_array__"}, ln);
+                            mk.args = std::move(dims);
+                            init = std::make_unique<ASTNode>(std::move(mk), ln);
+                        }
+                        else if (check(TokenType::LPAREN))
                         {
                             // ClassName varName(args) — constructor call as initializer
                             auto callee = std::make_unique<ASTNode>(Identifier{typeName}, ln);
@@ -1043,6 +1147,39 @@ ASTNodePtr Parser::parseClassDecl()
         consume();
         base = expect(TokenType::IDENTIFIER, "Expected base class name").value;
     }
+    // C++-style: class Dog : public Animal {  (also private/protected/plain)
+    else if (check(TokenType::COLON) && pos + 1 < tokens.size() &&
+             tokens[pos + 1].type == TokenType::IDENTIFIER)
+    {
+        size_t la = pos + 1;
+        if (tokens[la].value == "public" || tokens[la].value == "private" ||
+            tokens[la].value == "protected")
+            la++;
+        size_t la2 = la + 1;
+        while (la2 < tokens.size() && tokens[la2].type == TokenType::NEWLINE)
+            la2++;
+        if (la < tokens.size() && tokens[la].type == TokenType::IDENTIFIER &&
+            la2 < tokens.size() &&
+            (tokens[la2].type == TokenType::LBRACE || tokens[la2].type == TokenType::COMMA))
+        {
+            consume(); // eat ':'
+            if (current().value == "public" || current().value == "private" ||
+                current().value == "protected")
+                consume();
+            base = consume().value;
+            // Extra bases: class C : public A, public B — keep the first only
+            while (check(TokenType::COMMA))
+            {
+                consume();
+                if (check(TokenType::IDENTIFIER) &&
+                    (current().value == "public" || current().value == "private" ||
+                     current().value == "protected"))
+                    consume();
+                if (check(TokenType::IDENTIFIER))
+                    consume();
+            }
+        }
+    }
 
     match(TokenType::COLON);
     skipNewlines();
@@ -1154,6 +1291,23 @@ ASTNodePtr Parser::parseClassDecl()
                 continue;
             }
 
+            // Handle nested C++ struct definitions: struct Entry { ... };
+            if (check(TokenType::IDENTIFIER) &&
+                (current().value == "struct" || current().value == "union") &&
+                pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::IDENTIFIER)
+            {
+                size_t laS = pos + 2;
+                while (laS < tokens.size() && tokens[laS].type == TokenType::NEWLINE)
+                    laS++;
+                if (laS < tokens.size() && tokens[laS].type == TokenType::LBRACE)
+                {
+                    consume(); // eat 'struct' / 'union'
+                    cd.fields.push_back(parseClassDecl());
+                    skipNewlines();
+                    continue;
+                }
+            }
+
             auto isMethodName = [&](TokenType t)
             {
                 return t >= TokenType::IDENTIFIER && t <= TokenType::TYPE_UNSIGNED;
@@ -1199,7 +1353,8 @@ ASTNodePtr Parser::parseClassDecl()
                         size_t la2 = la + 1;
                         while (la2 < tokens.size() && tokens[la2].type == TokenType::NEWLINE)
                             la2++;
-                        if (la2 < tokens.size() && tokens[la2].type == TokenType::LPAREN)
+                        if ((la2 < tokens.size() && tokens[la2].type == TokenType::LPAREN) ||
+                            tokens[la].value == "operator") // bool operator<(...), int& operator[](...)
                         {
                             // It's a method with return type: "int getEnergyLevel()"
                             // Consume the type tokens as return type and fall through to method parsing
@@ -1244,13 +1399,17 @@ ASTNodePtr Parser::parseClassDecl()
                             {
                                 tdepth--;
                                 la++;
-                                break;
+                                if (tdepth <= 0)
+                                    break;
+                                continue;
                             }
                             else if (tokens[la].type == TokenType::RSHIFT)
                             {
                                 tdepth -= 2;
                                 la++;
-                                break;
+                                if (tdepth <= 0)
+                                    break;
+                                continue;
                             }
                             else if (tokens[la].type == TokenType::SEMICOLON ||
                                      tokens[la].type == TokenType::NEWLINE ||
@@ -1270,7 +1429,8 @@ ASTNodePtr Parser::parseClassDecl()
                         size_t la2 = la + 1;
                         while (la2 < tokens.size() && tokens[la2].type == TokenType::NEWLINE)
                             la2++;
-                        if (la2 < tokens.size() && tokens[la2].type == TokenType::LPAREN)
+                        if ((la2 < tokens.size() && tokens[la2].type == TokenType::LPAREN) ||
+                            tokens[la].value == "operator") // Iterator& operator++()
                         {
                             // This is a return-type + method-name pattern (e.g. "string getHeroName()"
                             // or "vector<int> getNeighbors()")
@@ -1342,14 +1502,54 @@ ASTNodePtr Parser::parseClassDecl()
                             consume();
                         continue;
                     }
-                    std::string fieldName = consume().value;
-                    ASTNodePtr init;
-                    if (match(TokenType::ASSIGN))
-                        init = parseExpr();
-                    // store as a VarDecl field
-                    auto fld = std::make_unique<ASTNode>(
-                        VarDecl{false, fieldName, std::move(init), typeToken}, ln);
-                    cd.fields.push_back(std::move(fld));
+                    // Parses one field (name, optional [dims], optional = init)
+                    // and appends it — supports "int arr[MAX], top;" comma lists.
+                    auto parseOneField = [&]()
+                    {
+                        while (check(TokenType::STAR) || check(TokenType::BIT_AND))
+                            consume();
+                        if (!isMethodName(current().type))
+                            return false;
+                        std::string fieldName = consume().value;
+                        ASTNodePtr init;
+                        std::vector<ASTNodePtr> dims;
+                        while (check(TokenType::LBRACKET))
+                        {
+                            consume(); // eat '['
+                            if (!check(TokenType::RBRACKET))
+                            {
+                                try
+                                {
+                                    dims.push_back(parseExpr());
+                                }
+                                catch (...)
+                                {
+                                }
+                            }
+                            if (check(TokenType::RBRACKET))
+                                consume();
+                        }
+                        if (match(TokenType::ASSIGN))
+                            init = parseExpr();
+                        else if (!dims.empty())
+                        {
+                            // int arr[MAX]; — allocate a zero-filled array
+                            CallExpr mk;
+                            mk.callee = std::make_unique<ASTNode>(Identifier{"__c_array__"}, ln);
+                            mk.args = std::move(dims);
+                            init = std::make_unique<ASTNode>(std::move(mk), ln);
+                        }
+                        cd.fields.push_back(std::make_unique<ASTNode>(
+                            VarDecl{false, fieldName, std::move(init), typeToken}, ln));
+                        return true;
+                    };
+                    parseOneField();
+                    while (check(TokenType::COMMA))
+                    {
+                        consume();
+                        if (!parseOneField())
+                            break;
+                    }
                     while (!atEnd() && !check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) && !check(TokenType::RBRACE) && !check(TokenType::DEDENT))
                         consume(); // skip anything remaining on line
                     while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
@@ -1361,6 +1561,50 @@ ASTNodePtr Parser::parseClassDecl()
             // Accept keyword tokens as method names (print, from, etc.)
             std::string methodName = current().value;
             consume(); // eat the method name token regardless of its type
+
+            // C++ operator overloading: operator[] operator() operator< operator++ ...
+            // Map to Quantum magic-method names so the VM can dispatch them.
+            if (methodName == "operator")
+            {
+                if (check(TokenType::LBRACKET) && pos + 1 < tokens.size() &&
+                    tokens[pos + 1].type == TokenType::RBRACKET)
+                {
+                    consume(); // eat [
+                    consume(); // eat ]
+                    methodName = "__getitem__";
+                }
+                else if (check(TokenType::LPAREN) && pos + 1 < tokens.size() &&
+                         tokens[pos + 1].type == TokenType::RPAREN &&
+                         pos + 2 < tokens.size() && tokens[pos + 2].type == TokenType::LPAREN)
+                {
+                    consume(); // eat (
+                    consume(); // eat )
+                    methodName = "__call__";
+                }
+                else if (!check(TokenType::LPAREN))
+                {
+                    // Symbolic operator: consume operator tokens until the param list
+                    std::string sym;
+                    while (!atEnd() && !check(TokenType::LPAREN) && !check(TokenType::NEWLINE) &&
+                           !check(TokenType::LBRACE))
+                        sym += consume().value;
+                    if (sym == "<")       methodName = "__lt__";
+                    else if (sym == ">")  methodName = "__gt__";
+                    else if (sym == "<=") methodName = "__le__";
+                    else if (sym == ">=") methodName = "__ge__";
+                    else if (sym == "==") methodName = "__eq__";
+                    else if (sym == "!=") methodName = "__ne__";
+                    else if (sym == "+")  methodName = "__add__";
+                    else if (sym == "-")  methodName = "__sub__";
+                    else if (sym == "*")  methodName = "__mul__";
+                    else if (sym == "/")  methodName = "__div__";
+                    else if (sym == "++") methodName = "__inc__";
+                    else if (sym == "--") methodName = "__dec__";
+                    else if (sym == "<<") methodName = "__lshift__";
+                    else if (sym == ">>") methodName = "__rshift__";
+                    else                  methodName = "operator" + sym;
+                }
+            }
 
             // Normalize constructor names
             if (methodName == "constructor" || methodName == "__init__" || methodName == cd.name)
@@ -1430,6 +1674,24 @@ ASTNodePtr Parser::parseClassDecl()
                 // consume tokens until we hit : or { or NEWLINE or INDENT
                 while (!atEnd() && !check(TokenType::COLON) && !check(TokenType::LBRACE) && !check(TokenType::NEWLINE) && !check(TokenType::INDENT))
                     consume();
+            }
+
+            // Allow a C++ initializer list that starts on the next line:
+            //   Node(const K& k, shared_ptr<Node> n = nullptr)
+            //       : key(k), next(n) {}
+            if (check(TokenType::NEWLINE))
+            {
+                size_t laN = pos;
+                while (laN < tokens.size() && tokens[laN].type == TokenType::NEWLINE)
+                    ++laN;
+                if (laN + 2 < tokens.size() && tokens[laN].type == TokenType::COLON &&
+                    tokens[laN + 1].type == TokenType::IDENTIFIER &&
+                    (tokens[laN + 2].type == TokenType::LPAREN ||
+                     tokens[laN + 2].type == TokenType::LBRACE))
+                {
+                    while (check(TokenType::NEWLINE))
+                        consume();
+                }
             }
 
             // Only consume ':' here if it's a Python-style body colon (NOT a C++ initializer list).
@@ -1669,6 +1931,113 @@ ASTNodePtr Parser::parseWhileStmt()
     return std::make_unique<ASTNode>(WhileStmt{std::move(cond), std::move(body)}, ln);
 }
 
+// switch (x) { case a: ... case b: ... default: ... }
+// Desugars to:
+//   { let __sw_val = x
+//     let __sw_hit = false
+//     while (true) {
+//         if (__sw_hit or __sw_val == a) { __sw_hit = true; <case-a stmts> }
+//         if (__sw_hit or __sw_val == b) { __sw_hit = true; <case-b stmts> }
+//         <default stmts>          // fallthrough and no-match both reach here
+//         break
+//     } }
+// A 'break' inside a case body exits the while — matching C switch semantics,
+// and omitting it falls through to the next case, also matching C.
+ASTNodePtr Parser::parseSwitchStmt()
+{
+    int ln = current().line;
+    consume(); // eat 'switch'
+    expect(TokenType::LPAREN, "Expected '(' after switch");
+    auto subject = parseExpr();
+    expect(TokenType::RPAREN, "Expected ')' after switch expression");
+    skipNewlines();
+    expect(TokenType::LBRACE, "Expected '{' to open switch body");
+    skipNewlines();
+
+    static int swCounter = 0;
+    std::string valName = "__sw_val_" + std::to_string(swCounter);
+    std::string hitName = "__sw_hit_" + std::to_string(swCounter);
+    swCounter++;
+
+    BlockStmt outer;
+    outer.statements.push_back(std::make_unique<ASTNode>(
+        VarDecl{false, valName, std::move(subject), ""}, ln));
+    outer.statements.push_back(std::make_unique<ASTNode>(
+        VarDecl{false, hitName, std::make_unique<ASTNode>(BoolLiteral{false}, ln), ""}, ln));
+
+    BlockStmt loopBody;
+
+    auto atCaseKeyword = [&](const char *kw)
+    {
+        return check(TokenType::IDENTIFIER) && current().value == kw;
+    };
+    auto atAnyCase = [&]()
+    {
+        return atCaseKeyword("case") || atCaseKeyword("default");
+    };
+
+    while (!atEnd() && !check(TokenType::RBRACE))
+    {
+        skipNewlines();
+        if (check(TokenType::RBRACE) || atEnd())
+            break;
+        if (atCaseKeyword("case"))
+        {
+            int cln = current().line;
+            consume(); // eat 'case'
+            auto caseVal = parseExpr();
+            expect(TokenType::COLON, "Expected ':' after case value");
+            skipNewlines();
+
+            BlockStmt caseBody;
+            // __sw_hit = true  (records the match so later cases fall through)
+            caseBody.statements.push_back(std::make_unique<ASTNode>(ExprStmt{
+                std::make_unique<ASTNode>(AssignExpr{"=",
+                    std::make_unique<ASTNode>(Identifier{hitName}, cln),
+                    std::make_unique<ASTNode>(BoolLiteral{true}, cln)}, cln)}, cln));
+            while (!atEnd() && !check(TokenType::RBRACE) && !atAnyCase())
+            {
+                caseBody.statements.push_back(parseStatement());
+                skipNewlines();
+            }
+            // if (__sw_hit or __sw_val == caseVal) { <caseBody> }
+            auto eq = std::make_unique<ASTNode>(BinaryExpr{"==",
+                std::make_unique<ASTNode>(Identifier{valName}, cln),
+                std::move(caseVal)}, cln);
+            auto cond = std::make_unique<ASTNode>(BinaryExpr{"or",
+                std::make_unique<ASTNode>(Identifier{hitName}, cln),
+                std::move(eq)}, cln);
+            loopBody.statements.push_back(std::make_unique<ASTNode>(IfStmt{
+                std::move(cond),
+                std::make_unique<ASTNode>(std::move(caseBody), cln),
+                nullptr}, cln));
+        }
+        else if (atCaseKeyword("default"))
+        {
+            consume(); // eat 'default'
+            expect(TokenType::COLON, "Expected ':' after default");
+            skipNewlines();
+            // Default runs whenever control reaches it (fallthrough or no match)
+            while (!atEnd() && !check(TokenType::RBRACE) && !atAnyCase())
+            {
+                loopBody.statements.push_back(parseStatement());
+                skipNewlines();
+            }
+        }
+        else
+        {
+            consume(); // skip stray token to avoid an infinite loop
+        }
+    }
+    expect(TokenType::RBRACE, "Expected '}' to close switch");
+
+    loopBody.statements.push_back(std::make_unique<ASTNode>(BreakStmt{}, ln));
+    outer.statements.push_back(std::make_unique<ASTNode>(WhileStmt{
+        std::make_unique<ASTNode>(BoolLiteral{true}, ln),
+        std::make_unique<ASTNode>(std::move(loopBody), ln)}, ln));
+    return std::make_unique<ASTNode>(std::move(outer), ln);
+}
+
 ASTNodePtr Parser::parseForStmt()
 {
     int ln = current().line;
@@ -1684,6 +2053,64 @@ ASTNodePtr Parser::parseForStmt()
         std::string forOfVar; // set if this turns out to be for-of/for-in
         if (!check(TokenType::SEMICOLON))
         {
+            // ── C++ range-based for (generic): for ([const] Type[&*] name : xs) ──
+            //    for (const auto& x : xs)  for (int v : c)  for (pair<int,int> p : v)
+            {
+                size_t la = pos;
+                if (la < tokens.size() && tokens[la].type == TokenType::CONST)
+                    la++;
+                bool hasType = false;
+                if (la < tokens.size() && isCTypeKeyword(tokens[la].type))
+                {
+                    while (la < tokens.size() && isCTypeKeyword(tokens[la].type))
+                        la++;
+                    hasType = true;
+                }
+                else if (la < tokens.size() && tokens[la].type == TokenType::IDENTIFIER)
+                {
+                    la++;
+                    hasType = true;
+                    // Skip template arguments after the type name: pair<int,int>
+                    if (la < tokens.size() && tokens[la].type == TokenType::LT)
+                    {
+                        int tdepth = 1;
+                        la++;
+                        while (la < tokens.size() && tdepth > 0)
+                        {
+                            if (tokens[la].type == TokenType::LT)
+                                tdepth++;
+                            else if (tokens[la].type == TokenType::GT)
+                                tdepth--;
+                            else if (tokens[la].type == TokenType::RSHIFT)
+                                tdepth -= 2;
+                            la++;
+                        }
+                    }
+                }
+                // Skip pointer/ref/const qualifiers: auto& x, Node* n
+                while (la < tokens.size() &&
+                       (tokens[la].type == TokenType::STAR ||
+                        tokens[la].type == TokenType::BIT_AND ||
+                        tokens[la].type == TokenType::CONST))
+                    la++;
+                if (hasType && la + 1 < tokens.size() &&
+                    tokens[la].type == TokenType::IDENTIFIER &&
+                    tokens[la + 1].type == TokenType::COLON &&
+                    (la + 2 >= tokens.size() || tokens[la + 2].type != TokenType::COLON))
+                {
+                    // Consume everything up to the variable name → for-in loop
+                    while (pos < la)
+                        consume();
+                    std::string rangeVar = consume().value;
+                    consume(); // eat ':'
+                    auto iterable = parseExpr();
+                    expect(TokenType::RPAREN, "Expected ')'");
+                    match(TokenType::COLON);
+                    skipNewlines();
+                    auto body = parseBodyOrStatement();
+                    return std::make_unique<ASTNode>(ForStmt{rangeVar, "", std::move(iterable), std::move(body)}, ln);
+                }
+            }
             // let/const/type-keyword declaration OR plain expression
             if (check(TokenType::LET) || check(TokenType::CONST))
             {
@@ -1814,6 +2241,51 @@ ASTNodePtr Parser::parseForStmt()
                 }
                 else
                     initNode = std::make_unique<ASTNode>(ExprStmt{parseExpr()}, ln);
+            }
+            else if (check(TokenType::IDENTIFIER))
+            {
+                // ── C++ identifier-typed for init: for (size_t i = 0; ...) ────
+                //    also  for (Node* curr = head; ...)
+                size_t la = pos + 1;
+                // Skip template arguments after the type name
+                if (la < tokens.size() && tokens[la].type == TokenType::LT)
+                {
+                    int tdepth = 1;
+                    la++; // past '<'
+                    while (la < tokens.size() && tdepth > 0)
+                    {
+                        if (tokens[la].type == TokenType::LT)
+                            tdepth++;
+                        else if (tokens[la].type == TokenType::GT)
+                            tdepth--;
+                        else if (tokens[la].type == TokenType::RSHIFT)
+                            tdepth -= 2;
+                        la++;
+                    }
+                }
+                // Skip pointer/ref/const qualifiers
+                while (la < tokens.size() &&
+                       (tokens[la].type == TokenType::STAR ||
+                        tokens[la].type == TokenType::BIT_AND ||
+                        tokens[la].type == TokenType::CONST))
+                    la++;
+                bool isTypedInit = la + 1 < tokens.size() &&
+                                   tokens[la].type == TokenType::IDENTIFIER &&
+                                   tokens[la + 1].type == TokenType::ASSIGN;
+                if (isTypedInit)
+                {
+                    std::string hint = consume().value; // type name
+                    // Consume template args / qualifiers up to the var name
+                    while (pos < la)
+                        consume();
+                    initNode = parseCTypeVarDecl(hint);
+                }
+                else
+                {
+                    // Plain expression init
+                    auto expr = parseExpr();
+                    initNode = std::make_unique<ASTNode>(ExprStmt{std::move(expr)}, ln);
+                }
             }
             else
             {

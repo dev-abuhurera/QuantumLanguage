@@ -129,6 +129,51 @@ bool VM::valuesEqual(const QuantumValue &a, const QuantumValue &b)
 
 QuantumValue VM::execBinary(Op op, const QuantumValue &L, const QuantumValue &R, int line)
 {
+    // Operator overloading: dispatch to instance magic methods (__add__,
+    // __lt__, ...) when the left operand is a class instance that defines one.
+    // C++ operator methods (operator+, operator<, ...) are parsed to these names.
+    if (L.isInstance())
+    {
+        const char *magic = nullptr;
+        switch (op)
+        {
+        case Op::ADD:    magic = "__add__";    break;
+        case Op::SUB:    magic = "__sub__";    break;
+        case Op::MUL:    magic = "__mul__";    break;
+        case Op::DIV:    magic = "__div__";    break;
+        case Op::MOD:    magic = "__mod__";    break;
+        case Op::LT:     magic = "__lt__";     break;
+        case Op::GT:     magic = "__gt__";     break;
+        case Op::LTE:    magic = "__le__";     break;
+        case Op::GTE:    magic = "__ge__";     break;
+        case Op::EQ:     magic = "__eq__";     break;
+        case Op::NEQ:    magic = "__ne__";     break;
+        case Op::LSHIFT: magic = "__lshift__"; break;
+        case Op::RSHIFT: magic = "__rshift__"; break;
+        default:
+            break;
+        }
+        if (magic)
+        {
+            auto inst = L.asInstance();
+            for (auto *k = inst->klass.get(); k; k = k->base.get())
+            {
+                auto mit = k->methods.find(magic);
+                if (mit == k->methods.end())
+                    continue;
+                auto bm = std::make_shared<QuantumBoundMethod>();
+                bm->method = mit->second;
+                bm->self = L;
+                push(QuantumValue(bm));
+                push(L); // self
+                push(R); // other operand
+                callClosure(mit->second, 2, line);
+                runFrame(frames_.size() - 1);
+                return pop();
+            }
+        }
+    }
+
     // String concatenation
     if (op == Op::ADD && (L.isString() || R.isString()))
         return QuantumValue(L.toString() + R.toString());
@@ -313,6 +358,15 @@ void VM::closeUpvalues(size_t fromIdx)
 
 void VM::callValue(QuantumValue callee, int argCount, int line)
 {
+    // C++ dialect tolerance: properties like .size/.length yield a number
+    // directly, so "v.size()" ends up calling that number — treat a zero-arg
+    // call on a number as the number itself.
+    if (callee.isNumber() && argCount == 0)
+    {
+        pop(); // the callee
+        push(callee);
+        return;
+    }
     if (callee.isDict())
     {
         auto dict = callee.asDict();

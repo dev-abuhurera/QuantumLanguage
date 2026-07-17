@@ -65,5 +65,25 @@ QuantumValue VM::callDictMethod(std::shared_ptr<Dict> dict, const std::string &m
     }
     if (m == "size" || m == "length")
         return QuantumValue((double)dict->size());
+    // Python dict.update(other) — merge keys from another dict
+    if (m == "update")
+    {
+        if (!args.empty() && args[0].isDict())
+            for (auto &kv : *args[0].asDict())
+                (*dict)[kv.first] = kv.second;
+        return QuantumValue();
+    }
+    // Python dict.pop(key[, default])
+    if (m == "pop")
+    {
+        if (args.empty())
+            return QuantumValue();
+        auto it = dict->find(args[0].toString());
+        if (it == dict->end())
+            return args.size() > 1 ? args[1] : QuantumValue();
+        QuantumValue v = it->second;
+        dict->erase(it);
+        return v;
+    }
     throw TypeError("Dict has no method '" + m + "'");
 }

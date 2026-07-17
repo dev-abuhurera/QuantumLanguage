@@ -9,6 +9,19 @@ void Compiler::compileVarDecl(VarDecl &s, int line)
 {
     if (s.initializer)
         compileExpr(*s.initializer);
+    // C/C++ typed declarations default like value-initialisation:
+    // string/char → "", bool → false, numeric types → 0
+    else if (!s.isPointer && (s.typeHint == "string" || s.typeHint == "char"))
+        emit(Op::LOAD_CONST, addConst(QuantumValue(std::string(""))), line);
+    else if (!s.isPointer && s.typeHint == "bool")
+        emit(Op::LOAD_FALSE, 0, line);
+    else if (!s.isPointer && !s.typeHint.empty() &&
+             s.typeHint.find("[]") == std::string::npos &&
+             (s.typeHint.rfind("int", 0) == 0 || s.typeHint == "float" ||
+              s.typeHint == "double" || s.typeHint.rfind("long", 0) == 0 ||
+              s.typeHint == "short" || s.typeHint.rfind("unsigned", 0) == 0 ||
+              s.typeHint == "size_t"))
+        emit(Op::LOAD_CONST, addConst(QuantumValue(0.0)), line);
     else
         emit(Op::LOAD_NIL, 0, line);
 

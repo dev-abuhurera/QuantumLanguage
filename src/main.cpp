@@ -1,5 +1,4 @@
-/*
- * Quantum Language v2.0.0 — Bytecode VM
+ /* Quantum Language v2.0.0 — Bytecode VM
  *
  * Build defines (set by CMakeLists.txt):
  *   QUANTUM_MODE_COMPILER  → quantum.exe      (compiles .sa → .exe, then runs it)
@@ -24,6 +23,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <cstring>
+#include <cctype>
 #include <ctime>
 #include <iomanip>
 #include <cstdlib>
@@ -206,7 +206,194 @@ static std::shared_ptr<Chunk> compileSource(const std::string &source,
     return chunk;
 }
 
-// ─── runFile — interpret a .sa file in-place (no exe created) ─────────────────
+// ─── Dialect support ──────────────────────────────────────────────────────────
+// .js / .py / .rb / .c / .cpp files run natively on the Quantum VM through its
+// multi-syntax front-end — no node/python/gcc/g++ required.
+
+static std::string fileExtLower(const std::string &path)
+{
+    std::string ext = fs::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext;
+}
+
+static bool hasSupportedExt(const std::string &path)
+{
+    std::string ext = fileExtLower(path);
+    return ext == ".sa" || ext == ".js" || ext == ".py" ||
+           ext == ".rb" || ext == ".c" || ext == ".cpp";
+}
+
+// True if the source defines a function named main ("main" followed by "(",
+// not part of a longer identifier).
+static bool definesMainFunction(const std::string &src)
+{
+    size_t p = 0;
+    while ((p = src.find("main", p)) != std::string::npos)
+    {
+        bool leftOk = (p == 0) ||
+                      (!std::isalnum((unsigned char)src[p - 1]) && src[p - 1] != '_');
+        size_t q = p + 4;
+        while (q < src.size() && std::isspace((unsigned char)src[q]))
+            q++;
+        if (leftOk && q < src.size() && src[q] == '(')
+            return true;
+        p += 4;
+    }
+    return false;
+}
+
+// Remove leading/trailing spaces while preserving the original line indentation
+// separately. This is used only by the lightweight Ruby dialect normalizer.
+static std::string trimCopy(const std::string &value)
+{
+    size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return "";
+    size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+static bool startsWith(const std::string &value, const std::string &prefix)
+{
+    return value.size() >= prefix.size() &&
+           value.compare(0, prefix.size(), prefix) == 0;
+}
+
+// Ruby-style syntax is translated into the brace-based common syntax already
+// accepted by the Quantum lexer/parser. This intentionally implements a Ruby
+// subset; it does not embed or invoke the official Ruby interpreter.
+//
+// Supported normalizations include:
+//   puts expression       -> print(expression)
+//   print expression      -> print(expression)
+//   # comment             -> // comment
+//   if/elsif/else/end     -> brace-based conditionals
+//   unless condition      -> if (!(condition))
+//   while/until/end       -> brace-based loops
+//   def name(args)/end    -> function name(args) { ... }
+static std::string applyRubyDialect(const std::string &source)
+{
+    std::istringstream input(source);
+    std::ostringstream output;
+    std::string line;
+
+    while (std::getline(input, line))
+    {
+        size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos)
+        {
+            output << "\n";
+            continue;
+        }
+
+        std::string indentation = line.substr(0, first);
+        std::string code = trimCopy(line.substr(first));
+
+        // Full-line Ruby comments. Inline # comments are left unchanged so a
+        // # inside a string or interpolation-like text is never corrupted.
+        if (!code.empty() && code[0] == '#')
+        {
+            output << indentation << "//" << code.substr(1) << "\n";
+            continue;
+        }
+
+        // puts(...) and puts expression
+        if (startsWith(code, "puts("))
+        {
+            output << indentation << "print" << code.substr(4) << "\n";
+            continue;
+        }
+        if (startsWith(code, "puts "))
+        {
+            output << indentation << "print(" << trimCopy(code.substr(5)) << ")\n";
+            continue;
+        }
+
+        // Ruby print expression (print(...) already matches the common syntax).
+        if (startsWith(code, "print "))
+        {
+            output << indentation << "print(" << trimCopy(code.substr(6)) << ")\n";
+            continue;
+        }
+
+        if (startsWith(code, "elsif "))
+        {
+            output << indentation << "} else if ("
+                   << trimCopy(code.substr(6)) << ") {\n";
+            continue;
+        }
+        if (code == "else")
+        {
+            output << indentation << "} else {\n";
+            continue;
+        }
+        if (code == "end")
+        {
+            output << indentation << "}\n";
+            continue;
+        }
+
+        if (startsWith(code, "unless "))
+        {
+            output << indentation << "if (!("
+                   << trimCopy(code.substr(7)) << ")) {\n";
+            continue;
+        }
+        if (startsWith(code, "if "))
+        {
+            output << indentation << "if ("
+                   << trimCopy(code.substr(3)) << ") {\n";
+            continue;
+        }
+
+        if (startsWith(code, "until "))
+        {
+            output << indentation << "while (!("
+                   << trimCopy(code.substr(6)) << ")) {\n";
+            continue;
+        }
+        if (startsWith(code, "while "))
+        {
+            output << indentation << "while ("
+                   << trimCopy(code.substr(6)) << ") {\n";
+            continue;
+        }
+
+        if (startsWith(code, "def "))
+        {
+            std::string signature = trimCopy(code.substr(4));
+            output << indentation << "function " << signature << " {\n";
+            continue;
+        }
+
+        // Common Ruby literals mapped to the Quantum common representation.
+        if (code == "nil")
+            code = "null";
+
+        output << indentation << code << "\n";
+    }
+
+    return output.str();
+}
+
+// C/C++ programs only define main() — append a call so the program executes
+// after its top-level declarations load. Ruby files are first normalized into
+// the common Quantum syntax and then use the normal compiler/VM pipeline.
+static std::string applyDialect(std::string source, const std::string &path)
+{
+    std::string ext = fileExtLower(path);
+
+    if (ext == ".rb")
+        source = applyRubyDialect(source);
+
+    if ((ext == ".c" || ext == ".cpp") && definesMainFunction(source))
+        source += "\nmain()\n";
+
+    return source;
+}
+
+// ─── runFile — interpret a source file in-place (no exe created) ──────────────
 
 static void runFile(const std::string &path, bool debug = false)
 {
@@ -223,7 +410,7 @@ static void runFile(const std::string &path, bool debug = false)
     try
     {
         VM vm;
-        vm.run(compileSource(ss.str(), path, debug));
+        vm.run(compileSource(applyDialect(ss.str(), path), path, debug));
     }
     catch (const ParseError &e)
     {
@@ -263,7 +450,7 @@ static int checkFile(const std::string &path)
     ss << file.rdbuf();
     try
     {
-        Lexer l(ss.str());
+        Lexer l(applyDialect(ss.str(), path));
         auto tok = l.tokenize();
         Parser p(std::move(tok));
         auto ast = p.parse();
@@ -369,7 +556,7 @@ static std::string runVmGuarded(const std::string &source,
         try
         {
             VM vm;
-            vm.run(compileSource(source, path, false));
+            vm.run(compileSource(applyDialect(source, path), path, false));
         }
         catch (...)
         {
@@ -505,13 +692,15 @@ static TestResult testFile(const std::string &path)
     return res;
 }
 
-static void collectSaFiles(const fs::path &dir, std::vector<fs::path> &out)
+static void collectTestFiles(const fs::path &dir, std::vector<fs::path> &out)
 {
+    // Any file type the compiler runs natively is testable:
+    // .sa .js .py .rb .c .cpp — all share the same multi-syntax pipeline.
     if (!fs::exists(dir) || !fs::is_directory(dir))
         return;
     for (auto &e : fs::recursive_directory_iterator(
              dir, fs::directory_options::skip_permission_denied))
-        if (e.is_regular_file() && e.path().extension() == ".sa")
+        if (e.is_regular_file() && hasSupportedExt(e.path().string()))
             out.push_back(e.path());
 }
 
@@ -647,10 +836,10 @@ static int runTestExamples(const std::string &dir)
     g_testMode = true;
 
     std::vector<fs::path> files;
-    collectSaFiles(d, files);
+    collectTestFiles(d, files);
     if (files.empty())
     {
-        std::cout << "No .sa files found.\n";
+        std::cout << "No testable files found (.sa .js .py .rb .c .cpp).\n";
         return 0;
     }
     std::sort(files.begin(), files.end());
@@ -785,15 +974,19 @@ static void printHelp(const char *prog)
 {
     std::cout << Colors::BOLD << "Usage:\n"
               << Colors::RESET
-              << "  " << prog << " <file.sa>          Compile → <file>.exe then run it\n"
-              << "  " << prog << " --run <file.sa>    Interpret directly (no .exe)\n"
-              << "  " << prog << " --check <file.sa>  Parse + type-check only\n"
-              << "  " << prog << " --debug <file.sa>  Dump bytecode then run\n"
-              << "  " << prog << " --dis   <file.sa>  Dump bytecode only\n"
-              << "  " << prog << " --test  [dir]      Batch-test all .sa files\n"
-              << "  qrun <file.sa>              Interpret directly (no .exe)\n\n"
+              << "  " << prog << " <file>             Compile → <file>.exe then run it\n"
+              << "  " << prog << " --run <file>       Interpret directly (no .exe)\n"
+              << "  " << prog << " --check <file>     Parse + type-check only\n"
+              << "  " << prog << " --debug <file>     Dump bytecode then run\n"
+              << "  " << prog << " --dis   <file>     Dump bytecode only\n"
+              << "  " << prog << " --test  [dir]      Batch-test all supported source files\n"
+              << "  qrun <file>                 Interpret directly (no .exe)\n\n"
+              << "  Supported files: .sa .js .py .rb .c .cpp — all run natively on the\n"
+              << "  Quantum VM (multi-syntax subset; node/python/gcc NOT required)\n\n"
               << "  quantum hello.sa            → hello.exe created and run\n"
-              << "  qrun    hello.sa            → interpreted directly\n";
+              << "  quantum prog.c              → prog.exe created and run (no gcc)\n"
+              << "  qrun    hello.py            → interpreted directly\n"
+              << "  qrun    hello.rb            → Ruby-style subset interpreted directly\n";
 }
 
 // ─── findStubPath ─────────────────────────────────────────────────────────────
@@ -831,8 +1024,9 @@ static std::string findStubPath(const std::string &quantumExePath)
 }
 
 // ─── bundleAndRun ─────────────────────────────────────────────────────────────
-// Compiles .sa → bytecode, appends it to a copy of quantum_stub.exe,
-// writes <name>.exe next to the .sa file, then launches it and waits.
+// Compiles a source file (.sa/.js/.py/.rb/.c/.cpp) → bytecode, appends it to a
+// copy of quantum_stub.exe, writes <name>.exe next to the source file,
+// then launches it and waits.
 
 static int bundleAndRun(const std::string &path, const std::string &exePath)
 {
@@ -852,7 +1046,7 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
     std::shared_ptr<Chunk> chunk;
     try
     {
-        chunk = compileSource(ss.str(), path, false);
+        chunk = compileSource(applyDialect(ss.str(), path), path, false);
     }
     catch (const ParseError &e)
     {
@@ -1057,117 +1251,25 @@ int main(int argc, char *argv[])
         std::ifstream f(argv[2]);
         std::ostringstream ss;
         ss << f.rdbuf();
-        disassembleChunk(*compileSource(ss.str(), argv[2], false), std::cout);
+        disassembleChunk(*compileSource(applyDialect(ss.str(), argv[2]), argv[2], false), std::cout);
         return 0;
     }
     if (a1 == "--test")
         return runTestExamples(argc >= 3 ? argv[2] : "examples");
-    // qrun behavior by extension
-        // qrun behavior by extension
-        if (a1.size() >= 3 && a1.substr(a1.size() - 3) == ".sa")
-        {
-            // .sa only: Quantum interpreter mode, no exe generated
-            runFile(a1);
-            return 0;
-        }
-        else if (a1.size() >= 3 && a1.substr(a1.size() - 3) == ".js")
-        {
-            // JavaScript syntax check
-            std::string checkCmd = "node --check \"" + a1 + "\"";
-            int result = system(checkCmd.c_str());
-
-            if (result != 0)
-            {
-                std::cerr << "[Quantum Error] Invalid JavaScript syntax in " << a1 << "\n";
-                return result;
-            }
-
-            // Run JavaScript
-            std::string runCmd = "node \"" + a1 + "\"";
-            return system(runCmd.c_str());
-        }
-        else if (a1.size() >= 3 && a1.substr(a1.size() - 3) == ".py")
-        {
-            // Python syntax check (strict CPython grammar, no Quantum extensions)
-#ifdef _WIN32
-            std::string checkCmd = "python -m py_compile \"" + a1 + "\"";
-#else
-            std::string checkCmd = "python3 -m py_compile \"" + a1 + "\"";
-#endif
-            int result = system(checkCmd.c_str());
-
-            if (result != 0)
-            {
-                std::cerr << "[Quantum Error] Invalid Python syntax in " << a1 << "\n";
-                return result;
-            }
-
-            // Run Python
-#ifdef _WIN32
-            std::string runCmd = "python \"" + a1 + "\"";
-#else
-            std::string runCmd = "python3 \"" + a1 + "\"";
-#endif
-            return system(runCmd.c_str());
-        }
-        else if (a1.size() >= 2 && a1.substr(a1.size() - 2) == ".c")
-        {
-            // Compile C source
-            std::string out = a1.substr(0, a1.size() - 2) + EXE_EXT;
-
-            std::string compileCmd = "gcc \"" + a1 + "\" -o \"" + out + "\"";
-            int result = system(compileCmd.c_str());
-
-            if (result != 0)
-            {
-                std::cerr << "[Quantum Error] Invalid C syntax in " << a1 << "\n";
-                return result;
-            }
-
-            // Run executable
-            std::string runCmd = shellExec(out);
-            int runResult = system(runCmd.c_str());
-
-            // Delete generated executable
-            if (std::remove(out.c_str()) != 0)
-            {
-                std::cerr << "[Warning] Failed to delete temporary executable: " << out << "\n";
-            }
-
-            return runResult;
-        }
-        else if (a1.size() >= 4 && a1.substr(a1.size() - 4) == ".cpp")
-        {
-            // Compile C++ source
-            std::string out = a1.substr(0, a1.size() - 4) + EXE_EXT;
-
-            std::string compileCmd = "g++ \"" + a1 + "\" -o \"" + out + "\"";
-            int result = system(compileCmd.c_str());
-
-            if (result != 0)
-            {
-                std::cerr << "[Quantum Error] Invalid C++ syntax in " << a1 << "\n";
-                return result;
-            }
-
-            // Run executable
-            std::string runCmd = shellExec(out);
-            int runResult = system(runCmd.c_str());
-
-            // Delete generated executable
-            if (std::remove(out.c_str()) != 0)
-            {
-                std::cerr << "[Warning] Failed to delete temporary executable: " << out << "\n";
-            }
-
-            return runResult;
-        }
-        else
-        {
-            std::cerr << "[Error] Unsupported file type: " << a1 << "\n";
-            std::cerr << "Supported: .sa, .js, .py, .c, .cpp\n";
-            return 1;
-        }
+    // Any supported source file runs natively on the Quantum VM —
+    // .js/.py/.rb/.c/.cpp go through the same multi-syntax front-end as .sa,
+    // so no node/python/gcc/g++ is required.
+    if (hasSupportedExt(a1))
+    {
+        runFile(a1);
+        return 0;
+    }
+    else
+    {
+        std::cerr << "[Error] Unsupported file type: " << a1 << "\n";
+        std::cerr << "Supported: .sa, .js, .py, .rb, .c, .cpp (run natively on the Quantum VM)\n";
+        return 1;
+    }
 #endif
 
     // ══════════════════════════════════════════════════════════════
@@ -1224,7 +1326,7 @@ int main(int argc, char *argv[])
         ss << f.rdbuf();
         try
         {
-            disassembleChunk(*compileSource(ss.str(), argv[2], false), std::cout);
+            disassembleChunk(*compileSource(applyDialect(ss.str(), argv[2]), argv[2], false), std::cout);
         }
         catch (const std::exception &e)
         {
@@ -1234,91 +1336,13 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    // Default: compile .sa → hello.exe (using quantum_stub as template) → run
-    // Default: run based on file extension
-    if (arg.size() >= 3 && arg.substr(arg.size() - 3) == ".sa")
-    {
-        // Only .sa supports Quantum multi-syntax
+    // Default: compile any supported source file → <file>.exe → run.
+    // .js/.py/.rb/.c/.cpp compile through the same multi-syntax front-end as .sa,
+    // so no node/python/gcc/g++ is required and the produced .exe is standalone.
+    if (hasSupportedExt(arg))
         return bundleAndRun(arg, exePath);
-    }
-    else if (arg.size() >= 3 && arg.substr(arg.size() - 3) == ".js")
-    {
-        // JavaScript syntax check first
-        std::string checkCmd = "node --check \"" + arg + "\"";
-        int result = system(checkCmd.c_str());
 
-        if (result != 0)
-        {
-            std::cerr << "[Quantum Error] Invalid JavaScript syntax in " << arg << "\n";
-            return result;
-        }
-
-        // If syntax is valid, run JS
-        std::string runCmd = "node \"" + arg + "\"";
-        return system(runCmd.c_str());
-    }
-    else if (arg.size() >= 3 && arg.substr(arg.size() - 3) == ".py")
-    {
-        // Python syntax check first (strict CPython grammar, no Quantum extensions)
-#ifdef _WIN32
-        std::string checkCmd = "python -m py_compile \"" + arg + "\"";
-#else
-        std::string checkCmd = "python3 -m py_compile \"" + arg + "\"";
-#endif
-        int result = system(checkCmd.c_str());
-
-        if (result != 0)
-        {
-            std::cerr << "[Quantum Error] Invalid Python syntax in " << arg << "\n";
-            return result;
-        }
-
-        // If syntax is valid, run Python
-#ifdef _WIN32
-        std::string runCmd = "python \"" + arg + "\"";
-#else
-        std::string runCmd = "python3 \"" + arg + "\"";
-#endif
-        return system(runCmd.c_str());
-    }
-    else if (arg.size() >= 2 && arg.substr(arg.size() - 2) == ".c")
-    {
-        std::string out = arg.substr(0, arg.size() - 2) + EXE_EXT;
-
-        // C compiler will give C syntax errors
-        std::string compileCmd = "gcc \"" + arg + "\" -o \"" + out + "\"";
-        int result = system(compileCmd.c_str());
-
-        if (result != 0)
-        {
-            std::cerr << "[Quantum Error] Invalid C syntax in " << arg << "\n";
-            return result;
-        }
-
-        std::string runCmd = shellExec(out);
-        return system(runCmd.c_str());
-    }
-    else if (arg.size() >= 4 && arg.substr(arg.size() - 4) == ".cpp")
-    {
-        std::string out = arg.substr(0, arg.size() - 4) + EXE_EXT;
-
-        // C++ compiler will give C++ syntax errors
-        std::string compileCmd = "g++ \"" + arg + "\" -o \"" + out + "\"";
-        int result = system(compileCmd.c_str());
-
-        if (result != 0)
-        {
-            std::cerr << "[Quantum Error] Invalid C++ syntax in " << arg << "\n";
-            return result;
-        }
-
-        std::string runCmd = shellExec(out);
-        return system(runCmd.c_str());
-    }
-    else
-    {
-        std::cerr << "[Error] Unsupported file type: " << arg << "\n";
-        std::cerr << "Supported: .sa, .js, .py, .c, .cpp\n";
-        return 1;
-    }
+    std::cerr << "[Error] Unsupported file type: " << arg << "\n";
+    std::cerr << "Supported: .sa, .js, .py, .rb, .c, .cpp (run natively on the Quantum VM)\n";
+    return 1;
 }
