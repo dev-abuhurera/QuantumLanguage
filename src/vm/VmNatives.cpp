@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <cstring>
 
 extern bool g_testMode;
 
