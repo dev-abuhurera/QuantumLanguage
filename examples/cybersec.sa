@@ -140,20 +140,12 @@ fn get_service(port) {
 let scan_ports = [22, 80, 443, 8080, 3306, 9999, 12345]
 print("  Simulated scan of 192.168.1.1:")
 
-fn show_port_status(port) {
+for port in scan_ports {
     let status = "FILTERED"
     if is_common_port(port) { status = "OPEN" }
     let service = get_service(port)
     print("  Port", port, "->", status, "|", service)
 }
-
-show_port_status(22)
-show_port_status(80)
-show_port_status(443)
-show_port_status(8080)
-show_port_status(3306)
-show_port_status(9999)
-show_port_status(12345)
 
 # ── Password Strength Checker ─────────────────────────────────────────────
 print("\n[Password Strength Checker]")
@@ -193,7 +185,7 @@ fn check_password_strength(pw) {
 }
 
 let passwords = ["abc", "Password1", "Qu@ntum$ecur1ty!", "hello123"]
-fn show_password_strength_result(pw) {
+for pw in passwords {
     let result = check_password_strength(pw)
     print("  '" + pw + "' -> " + result["strength"] + " (score: " + str(result["score"]) + ")")
     let fb = result["feedback"]
@@ -201,10 +193,5 @@ fn show_password_strength_result(pw) {
         for tip in fb { print("    ↳", tip) }
     }
 }
-
-show_password_strength_result("abc")
-show_password_strength_result("Password1")
-show_password_strength_result("Qu@ntum$ecur1ty!")
-show_password_strength_result("hello123")
 
 print("\n[Done] Quantum CyberSec Demo Complete")
