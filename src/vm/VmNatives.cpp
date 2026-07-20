@@ -689,11 +689,17 @@ void VM::registerNatives()
         auto copy=std::make_shared<Array>(*args[0].asArray());
         std::reverse(copy->begin(),copy->end());
         return QuantumValue(copy); });
+
     reg("sum", [](std::vector<QuantumValue> args) -> QuantumValue
         {
-        if(args.empty()||!args[0].isArray()) throw RuntimeError("sum() requires array");
-        double s=0; for(auto &v:*args[0].asArray()) s+=toNum2(v,"sum");
-        return QuantumValue(s); });
+            if (args.empty()) throw RuntimeError("sum() requires at least one argument");
+            if (!args[0].isArray()) throw RuntimeError("sum() requires array");
+            double s = 0;
+            for (auto &v : *args[0].asArray())
+                s += toNum2(v, "sum");
+            return QuantumValue(s);
+        });
+
     reg("any", [](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.empty()) return QuantumValue(false);

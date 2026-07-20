@@ -408,10 +408,48 @@ void VM::callValue(QuantumValue callee, int argCount, int line)
 void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
 {
     auto &ch = *closure->chunk;
+    auto &params = ch.params;
 
-    while (argCount < (int)ch.params.size())
+    // --- Varargs (*args) support ---
+    int varargIndex = -1;
+    for (int i = 0; i < (int)params.size(); ++i)
     {
-        // Fill missing args with nil (default arg logic simplified)
+        if (!params[i].empty() && params[i][0] == '*')
+        {
+            varargIndex = i;
+            break;
+        }
+    }
+
+    if (varargIndex != -1)
+    {
+        // Collect remaining args into an array for the *param
+        auto varargArray = std::make_shared<std::vector<QuantumValue>>();
+        int fixedArgs = varargIndex;
+        int extraArgs = argCount - fixedArgs;
+
+        if (extraArgs < 0) extraArgs = 0;
+
+        // Pop extra args into the array (in reverse order, then reverse)
+        std::vector<QuantumValue> collected;
+        for (int i = 0; i < extraArgs; ++i)
+        {
+            collected.push_back(stack_.back());
+            stack_.pop_back();
+        }
+        std::reverse(collected.begin(), collected.end());
+        *varargArray = std::move(collected);
+
+        // Push the array back as a single argument
+        stack_.push_back(QuantumValue(varargArray));
+
+        // Adjust argCount so it matches the parameter count (fixed + 1 for vararg)
+        argCount = fixedArgs + 1;
+    }
+
+    // Fill missing args with nil (existing logic)
+    while (argCount < (int)params.size())
+    {
         push(QuantumValue());
         argCount++;
     }
