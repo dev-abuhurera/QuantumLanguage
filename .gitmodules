@@ -1,6 +1,6 @@
 [submodule "Website"]
 	path = Website
-	url = https://github.com/SENODROOM/QuantumLanguage-Website.git
+	url = https://github.com/QuantumLogicsLabs/QuantumLanguage-Website.git
 	branch = main
 [submodule "code-explaination"]
 	path = docs/code-explanation
