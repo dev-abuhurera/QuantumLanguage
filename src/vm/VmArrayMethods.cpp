@@ -62,6 +62,65 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
     }
     if (m == "empty")
         return QuantumValue(arr->empty());
+    // Ruby Enumerable aggregates over a plain array.
+    if (m == "min" || m == "max")
+    {
+        if (arr->empty())
+            return QuantumValue();
+        QuantumValue best = (*arr)[0];
+        for (auto &v : *arr)
+        {
+            bool less = (v.isNumber() && best.isNumber())
+                            ? v.asNumber() < best.asNumber()
+                            : v.toString() < best.toString();
+            if (m == "min" ? less : !less && !VM::valuesEqual(v, best))
+                best = v;
+        }
+        return best;
+    }
+    // Ruby Enumerable#each_slice(n) — split into n-sized sub-arrays.
+    if (m == "each_slice")
+    {
+        int n = args.empty() ? 1 : (int)args[0].asNumber();
+        if (n < 1)
+            n = 1;
+        auto result = std::make_shared<Array>();
+        for (size_t i = 0; i < arr->size(); i += n)
+        {
+            auto slice = std::make_shared<Array>();
+            for (size_t j = i; j < arr->size() && j < i + n; ++j)
+                slice->push_back((*arr)[j]);
+            result->push_back(QuantumValue(slice));
+        }
+        return QuantumValue(result);
+    }
+    if (m == "uniq")
+    {
+        auto r = std::make_shared<Array>();
+        for (auto &v : *arr)
+        {
+            bool seen = false;
+            for (auto &u : *r)
+                if (VM::valuesEqual(u, v))
+                {
+                    seen = true;
+                    break;
+                }
+            if (!seen)
+                r->push_back(v);
+        }
+        return QuantumValue(r);
+    }
+    if (m == "compact")
+    {
+        auto r = std::make_shared<Array>();
+        for (auto &v : *arr)
+            if (!v.isNil())
+                r->push_back(v);
+        return QuantumValue(r);
+    }
+    if (m == "last")
+        return arr->empty() ? QuantumValue() : arr->back();
     if (m == "front")
         return arr->empty() ? QuantumValue() : arr->front();
     if (m == "back" || m == "top")
@@ -232,7 +291,7 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
         arr->clear();
         return QuantumValue();
     }
-    if (m == "copy" || m == "dup" || m == "clone")
+    if (m == "copy" || m == "dup" || m == "clone" || m == "to_a")
     {
         return QuantumValue(std::make_shared<Array>(*arr));
     }
@@ -299,6 +358,78 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
         auto result = std::make_shared<Array>();
         for (auto &v : *arr)
             if (callFn(fn, {v}).isTruthy())
+                result->push_back(v);
+        return QuantumValue(result);
+    }
+    // Ruby Enumerable#sum, optionally with a block mapping each element
+    // first (`ractors.sum(&:take)`).
+    if (m == "sum")
+    {
+        double total = 0;
+        for (auto &v : *arr)
+        {
+            QuantumValue item = args.empty() ? v : callFn(args[0], {v});
+            total += item.isNumber() ? item.asNumber() : 0;
+        }
+        return QuantumValue(total);
+    }
+    // Ruby Enumerable#sort_by / #min_by / #max_by — order by a computed key.
+    if (m == "sort_by" || m == "min_by" || m == "max_by")
+    {
+        if (args.empty())
+            throw RuntimeError(m + "() requires a callback");
+        QuantumValue fn = args[0];
+        std::vector<std::pair<QuantumValue, QuantumValue>> keyed; // (key, value)
+        for (auto &v : *arr)
+            keyed.emplace_back(callFn(fn, {v}), v);
+        auto keyLess = [](const QuantumValue &a, const QuantumValue &b)
+        {
+            if (a.isNumber() && b.isNumber())
+                return a.asNumber() < b.asNumber();
+            return a.toString() < b.toString();
+        };
+        if (m == "sort_by")
+        {
+            std::stable_sort(keyed.begin(), keyed.end(),
+                             [&](const std::pair<QuantumValue, QuantumValue> &a,
+                                 const std::pair<QuantumValue, QuantumValue> &b)
+                             { return keyLess(a.first, b.first); });
+            auto result = std::make_shared<Array>();
+            for (auto &kv : keyed)
+                result->push_back(kv.second);
+            return QuantumValue(result);
+        }
+        if (keyed.empty())
+            return QuantumValue();
+        auto best = keyed.front();
+        for (auto &kv : keyed)
+            if (m == "min_by" ? keyLess(kv.first, best.first) : keyLess(best.first, kv.first))
+                best = kv;
+        return best.second;
+    }
+    // Ruby Array#bsearch / #bsearch_index (find-minimum mode): the index
+    // of, or the value at, the first element whose predicate is true.
+    // Scanned linearly — same result on the sorted input the method
+    // expects, without assuming the predicate is well-behaved.
+    if (m == "bsearch" || m == "bsearch_index")
+    {
+        if (args.empty())
+            throw RuntimeError(m + "() requires a callback");
+        QuantumValue fn = args[0];
+        for (size_t i = 0; i < arr->size(); ++i)
+            if (callFn(fn, {(*arr)[i]}).isTruthy())
+                return m == "bsearch" ? (*arr)[i] : QuantumValue((double)i);
+        return QuantumValue();
+    }
+    // Ruby Enumerable#reject — the inverse of filter/select.
+    if (m == "reject")
+    {
+        if (args.empty())
+            throw RuntimeError("reject() requires a callback");
+        QuantumValue fn = args[0];
+        auto result = std::make_shared<Array>();
+        for (auto &v : *arr)
+            if (!callFn(fn, {v}).isTruthy())
                 result->push_back(v);
         return QuantumValue(result);
     }
