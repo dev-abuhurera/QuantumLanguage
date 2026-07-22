@@ -7,6 +7,11 @@
 QuantumValue VM::callDictMethod(std::shared_ptr<Dict> dict, const std::string &m,
                                 std::vector<QuantumValue> args)
 {
+    // Ruby's `obj.respond_to?(:name)` reflection check. The native
+    // objects this VM hands back for Thread/Queue/socket/... are dicts
+    // whose methods are ordinary keys, so membership is the answer.
+    if (m == "respond_to")
+        return QuantumValue(!args.empty() && dict->count(args[0].toString()) > 0);
     if (m == "keys")
     {
         auto arr = std::make_shared<Array>();

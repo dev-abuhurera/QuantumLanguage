@@ -652,6 +652,19 @@ void VM::runFrame(size_t stopDepth)
                 }
                 if (found)
                     break;
+
+                // 3. Unknown name on an instance -> nil, matching Ruby's
+                // (and Python's) "unset attribute reads as nil" semantics.
+                // Falling through to the builtin-method wrapper below would
+                // instead yield a truthy native object for a plain field
+                // read — which silently turns `while (node)` style loops
+                // over an unset link (`node.next_node`) into infinite
+                // loops. That wrapper can only ever throw for an instance
+                // anyway (callBuiltinMethod has no instance branch beyond
+                // methods/fields already checked here), so nil is strictly
+                // more useful as well as more correct.
+                push(QuantumValue());
+                break;
             }
 
             if (obj.isClass())

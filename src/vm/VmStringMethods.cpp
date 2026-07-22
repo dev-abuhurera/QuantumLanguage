@@ -90,6 +90,25 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
     // Ruby String#reverse
     if (m == "reverse")
         return QuantumValue(std::string(str.rbegin(), str.rend()));
+    // Ruby String#empty? / #chars / #each_char
+    if (m == "empty")
+        return QuantumValue(str.empty());
+    if (m == "chars")
+    {
+        auto arr = std::make_shared<Array>();
+        for (char c : str)
+            arr->push_back(QuantumValue(std::string(1, c)));
+        return QuantumValue(arr);
+    }
+    if (m == "each_char")
+    {
+        // The callback is invoked through the same dispatch the array
+        // higher-order methods use, by delegating to a chars array.
+        auto arr = std::make_shared<Array>();
+        for (char c : str)
+            arr->push_back(QuantumValue(std::string(1, c)));
+        return callArrayMethod(arr, "each", args);
+    }
     // Ruby String#to_i / #to_f / #to_s — parse a leading numeric prefix.
     if (m == "to_i")
     {
@@ -139,7 +158,7 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
         std::string s = args[0].toString();
         return QuantumValue(str.size() >= s.size() && str.substr(str.size() - s.size()) == s);
     }
-    if (m == "includes" || m == "contains")
+    if (m == "includes" || m == "contains" || m == "include")
     {
         if (args.empty())
             return QuantumValue(false);

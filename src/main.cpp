@@ -463,7 +463,13 @@ static const std::set<std::string> &rbZeroArgMethods(bool strict)
     static const std::set<std::string> strictNames = {
         "reverse", "chomp", "downcase", "upcase", "dup", "clone", "sort",
         "strip", "trim", "to_i", "to_f", "to_s", "zero", "chars", "length",
-        "size", "now", "message"};
+        "size", "now", "message",
+        // Collection/string queries idiomatically called without parens.
+        "shift", "pop", "empty", "keys", "first", "last", "sum",
+        "uniq", "flatten", "compact", "min", "max", "count", "to_a", "to_sym",
+        "abs", "round", "floor", "ceil", "even", "odd", "positive", "negative",
+        "capitalize", "swapcase", "join", "close",
+        "lines", "split", "sort_by", "freeze", "inspect"};
     static const std::set<std::string> mixedNames = {
         "reverse", "chomp", "downcase", "upcase", "dup", "clone",
         "to_i", "to_f", "to_s", "chars"};
@@ -477,6 +483,7 @@ struct RubySymbolTable
 {
     std::set<std::string> fields;
     std::set<std::string> methods;
+    std::set<std::string> blockMethods; // methods whose body uses yield/block_given?
 };
 
 static const RubySymbolTable &rbEmptySymbolTable()
@@ -530,6 +537,38 @@ static std::string rbNormalizeAtoms(const std::string &s,
             i = j;
             continue;
         }
+        // Ruby numeric literals allow `_` as a readability separator
+        // (`1_000_000_007`) — Quantum's lexer doesn't, so strip them here.
+        if (std::isdigit((unsigned char)c))
+        {
+            size_t j = i;
+            while (j < s.size() && (std::isdigit((unsigned char)s[j]) || s[j] == '_' ||
+                                    (s[j] == '.' && j + 1 < s.size() && std::isdigit((unsigned char)s[j + 1]))))
+                j++;
+            for (size_t k = i; k < j; k++)
+                if (s[k] != '_')
+                    out += s[k];
+            i = j;
+            continue;
+        }
+        // Ruby Symbol literal (`:name`, `:each`, `:value?`) -> a plain
+        // string, the simplest faithful stand-in for a lightweight
+        // string-like identifier. Guarded so `::` (namespace scoping) and
+        // `key: value` hash shorthand (colon *after* the identifier) never
+        // match — only a colon immediately followed by an identifier, not
+        // itself preceded or followed by another colon, is a real symbol.
+        if (c == ':' && i + 1 < s.size() && rbIsIdentStart(s[i + 1]) &&
+            (i == 0 || s[i - 1] != ':'))
+        {
+            size_t j = i + 1;
+            while (j < s.size() && rbIsIdentChar(s[j]))
+                j++;
+            if (j < s.size() && (s[j] == '?' || s[j] == '!'))
+                j++;
+            out += "\"" + s.substr(i + 1, j - i - 1) + "\"";
+            i = j;
+            continue;
+        }
         if (rbIsIdentStart(c))
         {
             size_t j = i + 1;
@@ -544,6 +583,28 @@ static std::string rbNormalizeAtoms(const std::string &s,
                 suffixStripped = true;
             }
             bool followedByParen = (j < s.size() && s[j] == '(');
+            // Ruby's `block_given?` reflection check — the transpiled
+            // equivalent of an implicit block is the trailing `__block__`
+            // parameter a `def` gains once its body is seen to use
+            // yield/block_given? (see the Def-frame bookkeeping in the main
+            // pass), so "was one given" is simply "is it not null".
+            if (ident == "block_given" && suffixStripped)
+            {
+                out += "(__block__ != null)";
+                i = j;
+                continue;
+            }
+            // `yield(args)` as a sub-expression (not the whole statement —
+            // that form is already handled earlier in transformCore, before
+            // this runs). Only the parenthesized form is unambiguous enough
+            // to rewrite here; bare `yield expr` mid-expression is rare
+            // enough in practice to leave unhandled.
+            if (ident == "yield" && followedByParen)
+            {
+                out += "__block__";
+                i = j;
+                continue;
+            }
             // "input" is a plain, common Ruby variable name but a reserved
             // statement keyword/native function in Quantum (the scanf/cin
             // -style input statement, and the native input() call already
@@ -560,7 +621,10 @@ static std::string rbNormalizeAtoms(const std::string &s,
             // up Python-style `def` methods, and parenizing a bare
             // `obj.method` there would turn a bound-method reference into a
             // call — a silent behavior change.
-            else if (!followedByParen && hadDotBefore &&
+            // Never parenize a name the file also uses as an instance
+            // field: `node.value` is a field read, not a zero-arg call, and
+            // turning it into `node.value()` would break it.
+            else if (!followedByParen && hadDotBefore && !st.fields.count(ident) &&
                      (suffixStripped || rbZeroArgMethods(strict).count(ident) ||
                       (strict && st.methods.count(ident))))
                 out += "()";
@@ -679,6 +743,9 @@ static void rbCollectSymbols(const std::vector<std::string> &lines, RubySymbolTa
 {
     static const std::regex ivarRe("@([A-Za-z_][A-Za-z0-9_]*)");
     static const std::regex defRe("^\\s*def\\s+([A-Za-z_][A-Za-z0-9_]*[?!]?)");
+    static const std::regex yieldRe("\\b(yield|block_given\\?)\\b");
+    static const std::regex explicitBlockParamRe("[(,]\\s*&[A-Za-z_][A-Za-z0-9_]*\\s*\\)");
+    std::string currentMethod; // name of the def whose body we're currently inside
     for (auto &line : lines)
     {
         for (auto it = std::sregex_iterator(line.begin(), line.end(), ivarRe);
@@ -692,7 +759,19 @@ static void rbCollectSymbols(const std::vector<std::string> &lines, RubySymbolTa
                 name.pop_back();
             if (name != "initialize")
                 st.methods.insert(name);
+            currentMethod = name;
+            // `def f(x, &block)` — an explicit block-capture parameter
+            // right on the signature line — needs no body scan to know
+            // this method takes a block.
+            if (std::regex_search(line, explicitBlockParamRe))
+                st.blockMethods.insert(name);
         }
+        else if (!currentMethod.empty() && std::regex_search(line, yieldRe))
+        {
+            st.blockMethods.insert(currentMethod);
+        }
+        if (trimCopy(line) == "end")
+            currentMethod.clear();
     }
 }
 
@@ -858,7 +937,11 @@ static std::string rbConvertRangesOnce(const std::string &line, bool &changed)
     return line;
 }
 
-static std::string rbConvertRanges(std::string line)
+// `strict` gates the conversions whose Ruby spelling collides with syntax
+// that is already valid — and common — in existing .sa files: `=>` is a JS
+// arrow function there, `->` a return-type annotation, `.new` an ordinary
+// method name. Those must only be rewritten for real `.rb` files.
+static std::string rbConvertRanges(std::string line, bool strict = true)
 {
     for (int guard = 0; guard < 8; guard++)
     {
@@ -867,9 +950,105 @@ static std::string rbConvertRanges(std::string line)
         if (!changed)
             break;
     }
+    if (!strict)
+        return line;
+    // Ruby's sized-array constructors. These must precede the generic
+    // `X.new(...)` rewrite below, since "Array" is not a Quantum class and
+    // `Array(n, v)` would be an unresolved call.
+    //   Array.new(n, v) -> an n-element array filled with v
+    //   Array.new(n)    -> an n-element array of nil
+    static const std::regex arrayNewFillRe("Array\\.new\\(([^(),]*),\\s*([^()]*)\\)");
+    line = std::regex_replace(line, arrayNewFillRe, "range(0, $1).map(fn(__ai) { return $2 })");
+    static const std::regex arrayNewSizeRe("Array\\.new\\(([^(),]*)\\)");
+    line = std::regex_replace(line, arrayNewSizeRe, "range(0, $1).map(fn(__ai) { return nil })");
     // Ruby's `ClassName.new(args)` constructor call -> Quantum's `ClassName(args)`.
-    static const std::regex newCallRe("\\b([A-Za-z_][A-Za-z0-9_]*)\\.new\\(");
+    // The builtin modules below are provided as native objects that expose
+    // their own `new`, so their `.new` must survive this rewrite.
+    static const char *kBuiltinModules =
+        "(?!(?:Thread|Mutex|ConditionVariable|Queue|SizedQueue|File|Time|"
+        "Ractor|Fiber|TCPServer|TCPSocket|Struct|Dir|IO)\\b)";
+    static const std::regex newCallRe(
+        std::string("\\b") + kBuiltinModules + "([A-Za-z_][A-Za-z0-9_]*)\\.new\\(");
     line = std::regex_replace(line, newCallRe, "$1(");
+    // Ruby also allows the parameter-less form bare, `ClassName.new` with no
+    // parens at all — without this it's left as an unresolved reference to
+    // a (never-invoked) "new" property instead of a constructor call.
+    static const std::regex newBareRe(
+        std::string("\\b") + kBuiltinModules + "([A-Za-z_][A-Za-z0-9_]*)\\.new\\b(?!\\()");
+    line = std::regex_replace(line, newBareRe, "$1()");
+    // The excluded builtin modules keep their `.new`, but Ruby still allows
+    // it paren-less (`Queue.new`) — make that an actual call.
+    static const std::regex builtinNewBareRe(
+        "\\b(Thread|Mutex|ConditionVariable|Queue|SizedQueue|Ractor|Fiber)\\.new\\b(?!\\()");
+    line = std::regex_replace(line, builtinNewBareRe, "$1.new()");
+    // Ruby's "stabby lambda" -> Quantum's fn(...) literal.
+    static const std::regex lambdaParamsRe("->\\s*\\(([^()]*)\\)\\s*\\{");
+    line = std::regex_replace(line, lambdaParamsRe, "fn($1) {");
+    static const std::regex lambdaNoParamsRe("->\\s*\\{");
+    line = std::regex_replace(line, lambdaNoParamsRe, "fn() {");
+    // Ruby's old-style hash-rocket literal (`{ key => value }`) -> Quantum's
+    // `key: value` dict syntax. `rescue X => e` is handled by its own
+    // dedicated whole-line match before this ever runs, so it never reaches
+    // here — safe to convert every remaining ` => ` unconditionally.
+    static const std::regex hashRocketRe(" => ");
+    line = std::regex_replace(line, hashRocketRe, ": ");
+    // Ruby's spaceship operator (`a <=> b`, -1/0/1) -> a native call. Only
+    // matches simple operands (identifiers, member/index chains) — good
+    // enough for its common use as a comparator body, not a general
+    // expression-parenthesization pass.
+    static const std::regex spaceshipRe("([A-Za-z_][A-Za-z0-9_.\\[\\]]*)\\s*<=>\\s*([A-Za-z_][A-Za-z0-9_.\\[\\]]*)");
+    line = std::regex_replace(line, spaceshipRe, "__spaceship__($1, $2)");
+    // Ruby's two-argument slice, `obj[start, length]` — valid for both
+    // strings and arrays, so it maps to a helper that handles either.
+    // Single-index reads (including chained `dp[i][j]`) have no comma
+    // inside one pair of brackets and are left alone.
+    static const std::regex slice2Re(
+        "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)"
+        "\\[([^\\[\\],]+),\\s*([^\\[\\],]+)\\]");
+    line = std::regex_replace(line, slice2Re, "__slice2($1, $2, $3)");
+    // Ruby's conditional-assignment operators, which Quantum has no
+    // equivalent for:
+    //   x ||= v  ->  x = x || v      (assign unless already truthy)
+    //   x &&= v  ->  x = x && v
+    // Written as an explicit read-modify-write of the same lvalue, which
+    // is exactly the semantics for the simple targets used here
+    // (`memo[n] ||= ...`, `node.children[ch] ||= ...`).
+    static const std::regex orAssignRe(
+        "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+        "(?:\\[[^\\[\\]]*\\])*)\\s*\\|\\|=\\s*(.+)$");
+    line = std::regex_replace(line, orAssignRe, "$1 = $1 || ($2)");
+    static const std::regex andAssignRe(
+        "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+        "(?:\\[[^\\[\\]]*\\])*)\\s*&&=\\s*(.+)$");
+    line = std::regex_replace(line, andAssignRe, "$1 = $1 && ($2)");
+    // Ruby's namespaced float constants -> Quantum's globals.
+    static const std::regex infinityRe("Float::INFINITY");
+    line = std::regex_replace(line, infinityRe, "INF");
+    static const std::regex nanRe("Float::NAN");
+    line = std::regex_replace(line, nanRe, "NaN");
+    return line;
+}
+
+// Ruby's explicit block-capture parameter (`def f(x, &block)`), its
+// forwarding form at a call site (`g(x, &block)`), the symbol-to-proc
+// shorthand (`arr.map(&:upcase)`), and calling a captured block via
+// `block.call(x)` rather than `block(x)`. Strict (.rb) only: `&name`
+// immediately before a closing `)` is indistinguishable from C-style
+// address-of (confirmed real usage — `tcgetattr(STDIN_FILENO, &oldt)` in
+// the existing .sa corpus), so this must never run in mixed .sa mode.
+static std::string rbConvertBlockCapture(std::string line, bool strict)
+{
+    if (!strict)
+        return line;
+    static const std::regex blockCaptureRe("([(,]\\s*)&([A-Za-z_][A-Za-z0-9_]*)\\s*\\)");
+    line = std::regex_replace(line, blockCaptureRe, "$1$2)");
+    static const std::regex symbolProcRe("([(,]\\s*)&:([A-Za-z_][A-Za-z0-9_]*[?!]?)\\s*\\)");
+    line = std::regex_replace(line, symbolProcRe, "$1fn(__sp) { return __sp.$2() })");
+    static const std::regex blockCallRe("\\b([A-Za-z_][A-Za-z0-9_]*)\\.call\\(");
+    line = std::regex_replace(line, blockCallRe, "$1(");
+    // ...including the paren-less `job.call` form.
+    static const std::regex blockCallBareRe("\\b([A-Za-z_][A-Za-z0-9_]*)\\.call\\b(?!\\()");
+    line = std::regex_replace(line, blockCallBareRe, "$1()");
     return line;
 }
 
@@ -894,7 +1073,11 @@ static bool rbTryPushAppend(const std::string &code, std::string &outResult)
         return false;
     if (rbFindTopLevel(rhs, "<<") != std::string::npos)
         return false;
-    static const std::regex lvalRe("^[A-Za-z_][A-Za-z0-9_]*(\\[[^\\]]*\\])?$");
+    // A push target is a variable, an index into one, a field, or (once a
+    // defaulting hash read has been rewritten) a __hget/__hget_vivify call.
+    static const std::regex lvalRe(
+        "^(@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*"
+        "(\\[[^\\]]*\\]|\\([^()]*\\))?$");
     if (!std::regex_match(lhs, lvalRe))
         return false;
     outResult = lhs + ".push(" + rhs + ")";
@@ -916,6 +1099,19 @@ static std::string rbConvertRaiseComma(const std::string &code)
         return code;
     std::string msg = trimCopy(rest.substr(comma + 1));
     return "raise " + ident + "(" + msg + ")";
+}
+
+// Ruby's `if __FILE__ == $0` (or `$PROGRAM_NAME`) "only run when this file
+// is executed directly, not required as a library" idiom. Quantum's lexer
+// has no concept of `$`-prefixed globals at all, and every file passed to
+// qrun/quantum is always the one being run directly — there's no
+// require/load system where this file could be loaded as a library instead
+// — so the condition is definitionally always true here.
+static std::string rbSubstituteMainGuard(const std::string &cond)
+{
+    static const std::regex mainGuardRe(
+        "__FILE__\\s*==\\s*\\$(0|PROGRAM_NAME)|\\$(0|PROGRAM_NAME)\\s*==\\s*__FILE__");
+    return std::regex_replace(cond, mainGuardRe, "true");
 }
 
 // Ruby's bare `.split` (no args, whitespace-run splitting) -> a trimmed
@@ -962,15 +1158,29 @@ struct RubyBlockCall
 // brace-style if/else continuation (`} else if (...) {`), or a bare
 // single-line brace-complete statement (`if found { break }`). Without
 // this check every one of those non-Ruby cases would be misread as a block.
-static bool rbPrefixEndsWithBlockMethod(const std::string &prefix)
+static bool rbPrefixEndsWithBlockMethod(const std::string &prefix, const RubySymbolTable &st)
 {
     static const std::regex blockMethodRe(
         "(^loop$)|(\\.(each|each_with_index|map|select|filter|reduce|none|any|"
         "all|every|some|times|sort_by|reject|find|detect)[?!]?(\\([^()]*\\))?$)");
-    return std::regex_search(prefix, blockMethodRe);
+    if (std::regex_search(prefix, blockMethodRe))
+        return true;
+    // Thread.new / Ractor.new / Fiber.new take their body as a block.
+    static const std::regex ctorBlockRe("\\.new(\\([^()]*\\))?$");
+    if (std::regex_search(prefix, ctorBlockRe))
+        return true;
+    // A user-defined method whose own body uses yield/block_given? also
+    // takes a block — whether called bare (`traverse(x) { }`, a sibling
+    // call inside the same class) or with an explicit receiver
+    // (`obj.traverse(x) { }`).
+    static const std::regex callTailRe("(?:^|\\.)([A-Za-z_][A-Za-z0-9_]*)[?!]?(\\([^()]*\\))?$");
+    std::smatch m;
+    if (std::regex_search(prefix, m, callTailRe) && st.blockMethods.count(m[1].str()))
+        return true;
+    return false;
 }
 
-static bool rbTryInlineBraceBlock(const std::string &code, RubyBlockCall &out)
+static bool rbTryInlineBraceBlock(const std::string &code, RubyBlockCall &out, const RubySymbolTable &st)
 {
     if (!code.empty() && code[0] == '}')
         return false; // continuation of an earlier brace construct, not a fresh block
@@ -981,9 +1191,16 @@ static bool rbTryInlineBraceBlock(const std::string &code, RubyBlockCall &out)
     if (close == std::string::npos)
         return false;
     out.prefix = trimCopy(code.substr(0, open));
-    if (out.prefix.empty() || !rbPrefixEndsWithBlockMethod(out.prefix))
-        return false;
     std::string content = trimCopy(code.substr(open + 1, close - open - 1));
+    // A brace block whose body opens with `|params|` is unambiguously a
+    // Ruby block whatever the method is called — no hash literal or other
+    // construct starts that way. That covers the long tail of Enumerable
+    // methods (bsearch_index, each_cons, group_by, ...) without needing to
+    // enumerate them. Otherwise fall back to the known-block-method check.
+    bool hasBlockParams = !content.empty() && content[0] == '|';
+    if (out.prefix.empty() ||
+        (!hasBlockParams && !rbPrefixEndsWithBlockMethod(out.prefix, st)))
+        return false;
     out.suffix = trimCopy(code.substr(close + 1));
     if (!content.empty() && content[0] == '|')
     {
@@ -1010,6 +1227,33 @@ static bool rbTryTrailingDoOpener(const std::string &code, std::string &prefix, 
     prefix = trimCopy(m[1].str());
     params = trimCopy(m[2].str());
     return true;
+}
+
+// A Ruby block with multiple params (`{ |a, b| }`) attached to a method
+// that yields ONE value per iteration (each, map, select, ...) is Ruby's
+// implicit destructuring of that value (typically a paired sub-array, e.g.
+// `[[0,1],[1,2]].each { |a, b| }`) — NOT two separate arguments. Quantum's
+// each/map/etc. natives always call back with (value, index), so a 2-param
+// block would otherwise silently bind `b` to the loop index instead of the
+// second element. `each_with_index`/`times` genuinely do yield two values
+// already and must NOT be rewritten. Mutates `params` to a single synthetic
+// name and returns the destructuring assignments to prepend to the body
+// (empty if no rewrite was needed).
+static std::string rbApplyBlockDestructuring(const std::string &prefix, std::string &params)
+{
+    auto names = rbSplitTopLevel(params, ',');
+    if (names.size() < 2)
+        return "";
+    static const std::regex pairwiseRe("\\.(each_with_index|times)[?!]?(\\([^()]*\\))?$");
+    if (std::regex_search(prefix, pairwiseRe))
+        return "";
+    static int counter = 0;
+    std::string tmp = "__destructure" + std::to_string(counter++);
+    std::string bodyPrefix;
+    for (size_t k = 0; k < names.size(); k++)
+        bodyPrefix += trimCopy(names[k]) + " = " + tmp + "[" + std::to_string(k) + "]; ";
+    params = tmp;
+    return bodyPrefix;
 }
 
 // Builds the call-opening text for a Ruby block: appends the closure as an
@@ -1042,6 +1286,18 @@ struct RBFrame
     RBFrameKind kind = RBFrameKind::Other;
     int chainGroupId = -1;
     RBTailInfo last;
+    int signatureLineIndex = -1;    // Def only: index of its "function ... {" line
+    bool usesImplicitBlock = false; // Def only: body referenced yield/block_given?
+    // Def only: names already introduced in this method body (its params
+    // plus locals declared so far), so a name's FIRST assignment can be
+    // emitted as a real `let` declaration — see the local-declaration pass
+    // in the main loop for why that matters for closures.
+    std::set<std::string> declaredLocals;
+    // Branch only: set when this if/else chain is the right-hand side of an
+    // assignment (Ruby's `x = if cond ... else ... end` expression form).
+    // Each branch's tail statement then becomes `x = <tail>` instead of
+    // being left as a bare value.
+    std::string assignTarget;
 };
 
 // Extracts `module Name ... end` blocks from `lines`, storing their raw body
@@ -1064,6 +1320,97 @@ static std::vector<std::string> rbFlattenModules(std::vector<std::string> lines)
     };
 
     std::map<std::string, std::vector<std::string>> modules;
+
+    // Ruby's `Enumerable` mixin: every one of these methods is defined
+    // purely in terms of whatever `each` the including class provides — so
+    // it's synthesized here as ordinary Ruby-syntax lines (in the same
+    // subset this transpiler already understands) rather than as a special
+    // native feature. `include Enumerable` picks it up via the exact same
+    // splice mechanism as a real user-defined `module ... end`, below.
+    // Non-local `return` inside a block isn't supported by the transpiled
+    // closures (a real Quantum function return, not a return from the
+    // enclosing method), so `first` uses a flag instead of an early return.
+    modules["Enumerable"] = {
+        "  def to_a",
+        "    __r = []",
+        "    self.each { |x| __r << x }",
+        "    __r",
+        "  end",
+        "  def map",
+        "    __r = []",
+        "    self.each { |x| __r << yield(x) }",
+        "    __r",
+        "  end",
+        "  def select",
+        "    __r = []",
+        "    self.each { |x| __r << x if yield(x) }",
+        "    __r",
+        "  end",
+        "  def reject",
+        "    __r = []",
+        "    self.each { |x| __r << x unless yield(x) }",
+        "    __r",
+        "  end",
+        "  def reduce(initial)",
+        "    __acc = initial",
+        "    self.each { |x| __acc = yield(__acc, x) }",
+        "    __acc",
+        "  end",
+        "  def sum",
+        "    __t = 0",
+        "    self.each { |x| __t += x }",
+        "    __t",
+        "  end",
+        "  def count",
+        "    __n = 0",
+        "    self.each { |x| __n += 1 }",
+        "    __n",
+        "  end",
+        "  def include?(item)",
+        "    __found = false",
+        "    self.each { |x| __found = true if x == item }",
+        "    __found",
+        "  end",
+        "  def min",
+        "    __m = nil",
+        "    self.each { |x| __m = x if __m == nil || x < __m }",
+        "    __m",
+        "  end",
+        "  def max",
+        "    __m = nil",
+        "    self.each { |x| __m = x if __m == nil || x > __m }",
+        "    __m",
+        "  end",
+        "  def sort",
+        "    self.to_a.sort",
+        "  end",
+        "  def any?",
+        "    __found = false",
+        "    self.each { |x| __found = true if yield(x) }",
+        "    __found",
+        "  end",
+        "  def all?",
+        "    __r = true",
+        "    self.each { |x| __r = false unless yield(x) }",
+        "    __r",
+        "  end",
+        "  def none?",
+        "    __found = false",
+        "    self.each { |x| __found = true if yield(x) }",
+        "    !__found",
+        "  end",
+        "  def first",
+        "    __r = nil",
+        "    __done = false",
+        "    self.each do |x|",
+        "      unless __done",
+        "        __r = x",
+        "        __done = true",
+        "      end",
+        "    end",
+        "    __r",
+        "  end",
+    };
 
     for (size_t i = 0; i < lines.size(); i++)
     {
@@ -1106,6 +1453,107 @@ static std::vector<std::string> rbFlattenModules(std::vector<std::string> lines)
             result.push_back(line);
     }
     return result;
+}
+
+// A Ruby Hash created with a default: `Hash.new(0)` (plain default) or
+// `Hash.new { |h, k| h[k] = [] }` (auto-vivifying). Quantum dicts have no
+// notion of a default, so the declaration becomes a plain `{}` and every
+// *read* of that variable is redirected through __hget/__hget_vivify.
+struct RubyDefaultHash
+{
+    std::string defaultExpr;
+    bool vivify = false;
+};
+
+// Recognizes a `... = Hash.new(...)` declaration. Returns the assigned
+// variable name (possibly `@ivar`) or "" when the line isn't one.
+static std::string rbMatchDefaultHashDecl(const std::string &code, RubyDefaultHash &out)
+{
+    static const std::regex blockFormRe(
+        "^(@?[A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*Hash\\.new\\s*\\{\\s*\\|[^|]*\\|\\s*[A-Za-z_][A-Za-z0-9_]*\\[[^\\]]*\\]\\s*=\\s*(.+?)\\s*\\}\\s*$");
+    static const std::regex valueFormRe(
+        "^(@?[A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*Hash\\.new\\((.*)\\)\\s*$");
+    static const std::regex emptyFormRe("^(@?[A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*Hash\\.new\\s*$");
+    std::smatch m;
+    if (std::regex_match(code, m, blockFormRe))
+    {
+        out.defaultExpr = trimCopy(m[2].str());
+        out.vivify = true;
+        return m[1].str();
+    }
+    if (std::regex_match(code, m, valueFormRe))
+    {
+        out.defaultExpr = trimCopy(m[2].str());
+        out.vivify = false;
+        return m[1].str();
+    }
+    if (std::regex_match(code, m, emptyFormRe))
+    {
+        out.defaultExpr = "nil";
+        out.vivify = false;
+        return m[1].str();
+    }
+    return "";
+}
+
+// Redirects reads of a defaulting hash through the __hget helpers.
+// Assignments (`h[k] = v`) keep native SET_INDEX; compound assignments
+// (`h[k] += v`) expand to an explicit read-modify-write so the default
+// participates. Writes are matched first so they aren't rewritten as reads.
+static std::string rbApplyDefaultHashReads(std::string code,
+                                           const std::map<std::string, RubyDefaultHash> &hashes)
+{
+    for (auto &entry : hashes)
+    {
+        const std::string &name = entry.first;
+        const std::string helper = entry.second.vivify ? "__hget_vivify" : "__hget";
+        const std::string &def = entry.second.defaultExpr;
+        std::string esc;
+        for (char c : name) // name may contain no regex metachars, but be safe
+        {
+            if (!std::isalnum((unsigned char)c) && c != '_')
+                esc += '\\';
+            esc += c;
+        }
+        // A leading `@` isn't a word character, so `\b` before it would
+        // never match — anchor on the sigil itself for ivar-named hashes.
+        std::string boundary = (name[0] == '@') ? "" : "\\b";
+        esc = boundary + esc;
+
+        // h[k] op= v   ->   h[k] = __hget(h, k, def) op (v)
+        std::regex compoundRe(esc + "\\[([^\\[\\]]*)\\]\\s*([-+*/])=\\s*(.+)$");
+        code = std::regex_replace(code, compoundRe,
+                                  name + "[$1] = " + helper + "(" + name + ", $1, " + def + ") $2 ($3)");
+
+        // Remaining h[k] not followed by a bare '=' is a read.
+        std::regex readRe(esc + "\\[([^\\[\\]]*)\\](?!\\s*=[^=])");
+        code = std::regex_replace(code, readRe, helper + "(" + name + ", $1, " + def + ")");
+    }
+    return code;
+}
+
+// Ruby method-body locals must become real Quantum locals, not globals.
+// Quantum treats a bare `name = value` as a global store, but a method runs
+// against the *instance's* environment — so a nested block/closure created
+// in that method and later invoked from another frame resolves the name
+// against a different environment and sees nil. Declaring the first
+// assignment with `let` makes it a true local, which closures capture
+// correctly as an upvalue. Returns the name to record as declared, or "".
+static std::string rbLocalDeclName(const std::string &code, const std::set<std::string> &declared)
+{
+    static const std::regex simpleAssignRe("^([A-Za-z_][A-Za-z0-9_]*)\\s*=(?!=)\\s*(.+)$");
+    std::smatch m;
+    if (!std::regex_match(code, m, simpleAssignRe))
+        return "";
+    std::string name = m[1].str();
+    if (declared.count(name))
+        return ""; // already a local — a plain reassignment, not a declaration
+    // Never shadow language/keyword-ish names with a `let` declaration.
+    static const std::set<std::string> reserved = {
+        "self", "this", "true", "false", "nil", "null", "let", "const", "return"};
+    if (reserved.count(name))
+        return "";
+    return name;
 }
 
 // Expands Ruby multiple assignment (`a, b = b, a`, `arr[i], arr[j] = arr[j],
@@ -1163,6 +1611,10 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
     stack.push_back(RBFrame{}); // file-scope sentinel, never resolved
     std::map<int, std::vector<RBTailInfo>> branchGroups;
     int nextChainGroup = 0;
+    // Defaulting hashes seen so far, keyed by the variable name they were
+    // assigned to (file-wide; these scripts don't reuse a name for both a
+    // defaulting and a plain hash).
+    std::map<std::string, RubyDefaultHash> defaultHashes;
     std::map<size_t, std::string> caseSubjects;    // stack-depth -> subject, before first `when`
     std::map<int, std::string> caseSubjectByGroup; // chainGroupId -> subject, after first `when`
 
@@ -1171,11 +1623,26 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
         if (!stack.empty())
             stack.back().last = RBTailInfo{RBTailKind::Statement, idx, -1};
     };
+    // A statement referencing the implicit block (converted to `__block__`
+    // by the yield/block_given? handling) means the nearest enclosing `def`
+    // needs the trailing `__block__` parameter retrofitted once it closes.
+    auto markImplicitBlockUse = [&](const std::string &text)
+    {
+        if (text.find("__block__") == std::string::npos)
+            return;
+        for (auto it = stack.rbegin(); it != stack.rend(); ++it)
+            if (it->kind == RBFrameKind::Def)
+            {
+                it->usesImplicitBlock = true;
+                break;
+            }
+    };
     auto emit = [&](const std::string &indentation, const std::string &code, bool trackAsStatement)
     {
         outLines.push_back(indentation + code);
         if (trackAsStatement)
             markStatement((int)outLines.size() - 1);
+        markImplicitBlockUse(code);
     };
 
     std::function<void(const RBTailInfo &)> resolveTail = [&](const RBTailInfo &info)
@@ -1213,6 +1680,74 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
             startsWith(code, "attr_writer"))
             return ""; // direct field access already works; no getter needed
 
+        // `require`/`require_relative` have no analogue — everything these
+        // scripts require (thread, set, ...) is built into the VM already.
+        if (strict && (startsWith(code, "require ") || startsWith(code, "require_relative ")))
+            return "";
+
+        // A bare call to a method defined in this file (`some_method` alone
+        // on a line, Ruby's paren-less invocation) — without parens it is
+        // just an unused value reference and the call never happens.
+        if (strict)
+        {
+            static const std::regex bareCallRe("^([A-Za-z_][A-Za-z0-9_]*[?!]?)$");
+            std::smatch m;
+            if (std::regex_match(code, m, bareCallRe))
+            {
+                std::string base = m[1].str();
+                if (!base.empty() && (base.back() == '?' || base.back() == '!'))
+                    base.pop_back();
+                if (symbols.methods.count(base))
+                    code = base + "()";
+            }
+        }
+
+        // Defaulting Hash: record the declaration and reduce it to `{}`;
+        // subsequent reads of that name are redirected below.
+        if (strict)
+        {
+            RubyDefaultHash dh;
+            std::string hashName = rbMatchDefaultHashDecl(code, dh);
+            if (!hashName.empty())
+            {
+                // Recorded (and matched) in the pre-normalization spelling,
+                // since read-rewriting happens here — before `@x` becomes
+                // `self.x`.
+                defaultHashes[hashName] = dh;
+                code = hashName + " = {}";
+            }
+            else
+            {
+                code = rbApplyDefaultHashReads(code, defaultHashes);
+            }
+        }
+
+        // Modifier if/unless can appear inside a block body too (e.g.
+        // `each { |x| __r << x if yield(x) }`), which is transformed by
+        // recursing into transformCore on just the body text — so this
+        // needs the same handling the outer per-line loop already does,
+        // not just at true statement/line level.
+        {
+            static const std::regex modIfRe("^(.*\\S)\\s+(if|unless)\\s+(.+)$");
+            std::smatch m;
+            if (!startsWith(code, "if ") && !startsWith(code, "unless ") &&
+                rbUnambiguous(code) && (code.empty() || code[0] != '}') &&
+                rbFindTopLevel(code, "else if ") == std::string::npos &&
+                std::regex_match(code, m, modIfRe) &&
+                rbFindTopLevel(code, " " + m[2].str() + " ") != std::string::npos &&
+                rbFindTopLevel(m[3].str(), " else ") == std::string::npos &&
+                // `x = if cond` is an if-*expression*, not a modifier-if:
+                // the part before `if` is an incomplete assignment.
+                trimCopy(m[1].str()).back() != '=')
+            {
+                std::string stmt = transformCore(trimCopy(m[1].str()));
+                std::string cond = rbSubstituteMainGuard(rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(m[3].str()), strict), symbols), symbols, strict));
+                std::string wrappedCond = m[2].str() == "unless" ? "!(" + cond + ")" : cond;
+                if (!stmt.empty())
+                    return "if (" + wrappedCond + ") { " + stmt + " }";
+            }
+        }
+
         code = rbConvertRaiseComma(code);
 
         if (startsWith(code, "puts("))
@@ -1231,27 +1766,87 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
                 code = m[1].str() + "(" + m[2].str() + ")";
         }
 
-        RubyBlockCall block;
-        if (rbTryInlineBraceBlock(code, block))
+        // `yield` — the implicit-block invocation. The corresponding `def`
+        // gains a trailing `__block__` parameter once this is seen (handled
+        // where Def frames are popped in the main pass).
+        if (startsWith(code, "yield("))
+            code = "__block__" + code.substr(5);
+        else if (startsWith(code, "yield "))
+            code = "__block__(" + trimCopy(code.substr(6)) + ")";
+        else if (code == "yield")
+            code = "__block__()";
+
+        // Ruby's `Array.new(n) { |i| body }` generator form — "Array" isn't
+        // a Quantum class, so the generic ClassName.new(){block} handling
+        // (which would pass the block as an extra constructor argument)
+        // doesn't apply; build the array explicitly instead.
         {
-            std::string prefix = rbNormalizeAtoms(rbConvertRanges(block.prefix), symbols, strict);
+            // The block's `|i|` parameter is optional in Ruby — the common
+            // matrix idiom `Array.new(rows) { Array.new(cols, 0) }` omits
+            // it. Without the optional group that form would fall through
+            // to the plain sized-array rewrite and take the block as a
+            // stray second argument.
+            static const std::regex arrayNewBlockRe(
+                "Array\\.new\\(([^()]*)\\)\\s*\\{\\s*(?:\\|([^|]*)\\|)?\\s*([^{}]*?)\\s*\\}");
+            code = std::regex_replace(code, arrayNewBlockRe, "range(0, $1).map(fn($2) { return $3 })");
+        }
+
+        RubyBlockCall block;
+        if (rbTryInlineBraceBlock(code, block, symbols))
+        {
+            std::string prefix = rbNormalizeAtoms(rbConvertRanges(block.prefix, strict), symbols, strict);
+            std::string destructure = rbApplyBlockDestructuring(prefix, block.params);
             std::string body = transformCore(block.body);
             if (rbLooksLikeReturnable(body))
                 body = "return " + body;
             std::string opened = rbBuildBlockOpenText(prefix, block.params);
-            code = opened + " " + body + " })" + block.suffix;
+            code = opened + " " + destructure + body + " })" + block.suffix;
         }
 
         std::string pushed;
         if (rbTryPushAppend(code, pushed))
             code = pushed;
 
+        // Ruby's `return enum_for(:name) unless block_given?` guard returns
+        // a lazy Enumerator when called without a block, so that
+        // `obj.each_reverse.to_a` works. Nothing here is lazy, so collect
+        // eagerly instead: re-invoke the same method with a collector block
+        // and return the resulting array — indistinguishable for the
+        // to_a/map/each uses this supports.
+        if (strict)
+        {
+            static const std::regex enumForRe(
+                "return\\s+enum_for\\(\\s*:?\"?([A-Za-z_][A-Za-z0-9_]*)\"?\\s*\\)");
+            code = std::regex_replace(
+                code, enumForRe,
+                "let __e = []; self.$1(fn(__x) { __e.push(__x) }); return __e");
+        }
+
         code = rbConvertBareSplit(code);
-        code = rbConvertRanges(code);
+        code = rbConvertRanges(code, strict);
+        code = rbConvertBlockCapture(code, strict);
         code = rbConvertInterpolation(code, symbols);
         code = rbNormalizeAtoms(code, symbols, strict);
         if (code == "nil")
             code = "null";
+        // A statement starting with a bare array literal (Ruby's
+        // `[[a,b],...].each { }` iteration idiom) is otherwise ambiguous
+        // with the previous line's trailing expression continuing via
+        // postfix indexing (`prev\n[x]` parses as `prev[x]`) — the
+        // standard JS-style leading-semicolon guard disambiguates it.
+        // Strict-only: existing .sa files already rely on their own
+        // statement layout and don't need (or expect) the inserted `;`.
+        // Only a *complete, self-contained* statement qualifies: the
+        // literal must close on this line and then be used (`.each`,
+        // `.map`, ...). A line that merely starts with `[` because it is a
+        // continuation row of a multi-line literal, or an element of one,
+        // must be left alone.
+        if (strict && !code.empty() && code[0] == '[')
+        {
+            size_t close = rbMatchBracket(code, 0);
+            if (close != std::string::npos && close + 1 < code.size() && code[close + 1] == '.')
+                code = ";" + code;
+        }
         return code;
     };
 
@@ -1303,7 +1898,7 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
             {
                 for (size_t k = 0; k < expanded.size(); k++)
                 {
-                    std::string ln = rbConvertInterpolation(rbConvertRanges(expanded[k]), symbols);
+                    std::string ln = rbConvertInterpolation(rbConvertRanges(expanded[k], strict), symbols);
                     ln = rbNormalizeAtoms(ln, symbols, strict);
                     emit(indentation, ln, k + 1 == expanded.size());
                 }
@@ -1327,10 +1922,13 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
                 // Python inline ternary (`x = a if cond else b`) also matches
                 // this shape — its giveaway is a top-level ` else `, which a
                 // Ruby modifier-if never has. Leave it to the native parser.
-                rbFindTopLevel(m[3].str(), " else ") == std::string::npos)
+                rbFindTopLevel(m[3].str(), " else ") == std::string::npos &&
+                // `x = if cond` is an if-*expression*, not a modifier-if:
+                // the part before `if` is an incomplete assignment.
+                trimCopy(m[1].str()).back() != '=')
             {
                 std::string stmt = transformCore(trimCopy(m[1].str()));
-                std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(m[3].str())), symbols), symbols, strict);
+                std::string cond = rbSubstituteMainGuard(rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(m[3].str()), strict), symbols), symbols, strict));
                 std::string wrappedCond = m[2].str() == "unless" ? "!(" + cond + ")" : cond;
                 if (!stmt.empty())
                 {
@@ -1348,10 +1946,13 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
         {
             branchGroups[stack.back().chainGroupId].push_back(stack.back().last);
             int gid = stack.back().chainGroupId;
+            std::string carriedTarget = stack.back().assignTarget;
             stack.pop_back();
-            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(6))), symbols), symbols, strict);
+            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(6)), strict), symbols), symbols, strict);
             outLines.push_back(indentation + "} else if (" + cond + ") {");
-            stack.push_back(RBFrame{RBFrameKind::Branch, gid, RBTailInfo{}});
+            RBFrame f{RBFrameKind::Branch, gid, RBTailInfo{}};
+            f.assignTarget = carriedTarget; // an if-expression keeps its target across the chain
+            stack.push_back(f);
             continue;
         }
         if (code == "else" && stack.size() > 1 &&
@@ -1359,9 +1960,12 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
         {
             branchGroups[stack.back().chainGroupId].push_back(stack.back().last);
             int gid = stack.back().chainGroupId;
+            std::string carriedTarget = stack.back().assignTarget;
             stack.pop_back();
             outLines.push_back(indentation + "} else {");
-            stack.push_back(RBFrame{RBFrameKind::Branch, gid, RBTailInfo{}});
+            RBFrame f{RBFrameKind::Branch, gid, RBTailInfo{}};
+            f.assignTarget = carriedTarget;
+            stack.push_back(f);
             continue;
         }
         if (code == "end" && stack.size() > 1)
@@ -1373,7 +1977,25 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
                 {
                     branchGroups[top.chainGroupId].push_back(top.last);
                     outLines.push_back(indentation + "}");
-                    if (!stack.empty())
+                    if (!top.assignTarget.empty())
+                    {
+                        // if-as-expression: each branch's tail statement is
+                        // the branch's value, so assign it to the target.
+                        for (auto &b : branchGroups[top.chainGroupId])
+                        {
+                            if (b.kind != RBTailKind::Statement || b.stmtIndex < 0)
+                                continue;
+                            std::string &ln = outLines[b.stmtIndex];
+                            size_t p = ln.find_first_not_of(" \t");
+                            if (p == std::string::npos)
+                                continue;
+                            if (rbLooksLikeReturnable(ln.substr(p)))
+                                ln.insert(p, top.assignTarget + " = ");
+                        }
+                        if (!stack.empty())
+                            stack.back().last = RBTailInfo{};
+                    }
+                    else if (!stack.empty())
                         stack.back().last = RBTailInfo{RBTailKind::Chain, -1, top.chainGroupId};
                 }
                 else if (top.kind == RBFrameKind::ClosureDo)
@@ -1387,6 +2009,22 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
                 {
                     outLines.push_back(indentation + "}");
                     resolveTail(top.last);
+                    // Ruby methods take a block implicitly (no declared
+                    // parameter); yield/block_given? inside the body is
+                    // what signals one is expected. Retrofit it onto the
+                    // signature now that we know, matching how a caller's
+                    // `.method { ... }` block is already appended as the
+                    // trailing argument (same position, so this lines up).
+                    if (top.usesImplicitBlock && top.signatureLineIndex >= 0)
+                    {
+                        std::string &sigLine = outLines[top.signatureLineIndex];
+                        size_t lastParen = sigLine.rfind(')');
+                        if (lastParen != std::string::npos)
+                        {
+                            bool emptyArgs = lastParen > 0 && sigLine[lastParen - 1] == '(';
+                            sigLine.insert(lastParen, emptyArgs ? "__block__" : ", __block__");
+                        }
+                    }
                     if (!stack.empty())
                         stack.back().last = RBTailInfo{};
                 }
@@ -1400,30 +2038,55 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
             continue;
         }
 
+        // Ruby's if-as-expression: `x = if cond` / `x = case v`, whose
+        // branches each evaluate to the assigned value. Opens a normal
+        // brace-if here and records the target; each branch's tail
+        // statement gets `x = ` prefixed when the chain closes.
+        if (strict)
+        {
+            static const std::regex assignIfRe(
+                "^(.+?)\\s*=\\s*(if|unless)\\s+(.+)$");
+            std::smatch m;
+            if (std::regex_match(code, m, assignIfRe) &&
+                rbFindTopLevelAssign(code) != std::string::npos &&
+                rbHasMatchingEnd(rawLines, li))
+            {
+                std::string target = rbNormalizeAtoms(rbConvertRanges(trimCopy(m[1].str()), strict), symbols, strict);
+                std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(m[3].str()), strict), symbols), symbols, strict);
+                if (m[2].str() == "unless")
+                    cond = "!(" + cond + ")";
+                outLines.push_back(indentation + "if (" + cond + ") {");
+                RBFrame f{RBFrameKind::Branch, nextChainGroup++, RBTailInfo{}};
+                f.assignTarget = target;
+                stack.push_back(f);
+                continue;
+            }
+        }
+
         if (startsWith(code, "unless ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
         {
-            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(7))), symbols), symbols, strict);
+            std::string cond = rbSubstituteMainGuard(rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(7)), strict), symbols), symbols, strict));
             outLines.push_back(indentation + "if (!(" + cond + ")) {");
             stack.push_back(RBFrame{RBFrameKind::Branch, nextChainGroup++, RBTailInfo{}});
             continue;
         }
         if (startsWith(code, "if ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
         {
-            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(3))), symbols), symbols, strict);
+            std::string cond = rbSubstituteMainGuard(rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(3)), strict), symbols), symbols, strict));
             outLines.push_back(indentation + "if (" + cond + ") {");
             stack.push_back(RBFrame{RBFrameKind::Branch, nextChainGroup++, RBTailInfo{}});
             continue;
         }
         if (startsWith(code, "until ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
         {
-            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(6))), symbols), symbols, strict);
+            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(6)), strict), symbols), symbols, strict);
             outLines.push_back(indentation + "while (!(" + cond + ")) {");
             stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
             continue;
         }
         if (startsWith(code, "while ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
         {
-            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(6))), symbols), symbols, strict);
+            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(6)), strict), symbols), symbols, strict);
             outLines.push_back(indentation + "while (" + cond + ") {");
             stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
             continue;
@@ -1465,7 +2128,7 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
 
         if (startsWith(code, "case ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
         {
-            std::string subject = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(5))), symbols), symbols, strict);
+            std::string subject = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(5)), strict), symbols), symbols, strict);
             // Stash the subject via a marker frame; the first `when` opens
             // the actual branch. We reuse Other with chainGroupId encoding
             // deferred via a side map keyed by stack depth.
@@ -1495,7 +2158,7 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
                     gid = stack.back().chainGroupId;
                     stack.pop_back();
                 }
-                std::string valuesText = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(m[1].str()), symbols), symbols, strict);
+                std::string valuesText = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(m[1].str(), strict), symbols), symbols, strict);
                 auto values = rbSplitTopLevel(valuesText, ',');
                 std::string subj = isFirst ? subject : caseSubjectByGroup[gid];
                 caseSubjectByGroup[gid] = subj;
@@ -1511,6 +2174,7 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
                 {
                     std::string stmt = transformCore(trimCopy(m[3].str()));
                     outLines.push_back(indentation + opener + " " + stmt);
+                    markImplicitBlockUse(stmt);
                     stack.push_back(RBFrame{RBFrameKind::Branch, gid, RBTailInfo{RBTailKind::Statement, (int)outLines.size() - 1, -1}});
                 }
                 else
@@ -1551,11 +2215,30 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
             std::string signature = trimCopy(code.substr(4));
             static const std::regex initRe("^initialize(\\s*\\(.*)?$");
             signature = std::regex_replace(signature, initRe, "init$1");
+            signature = rbConvertBlockCapture(signature, strict);
             signature = rbNormalizeAtoms(signature, symbols, strict);
             if (signature.find('(') == std::string::npos)
                 signature += "()"; // Ruby allows parameter-less `def name`
             outLines.push_back(indentation + "function " + signature + " {");
-            stack.push_back(RBFrame{RBFrameKind::Def, -1, RBTailInfo{}});
+            RBFrame defFrame{RBFrameKind::Def, -1, RBTailInfo{}};
+            defFrame.signatureLineIndex = (int)outLines.size() - 1;
+            // Seed the method's parameter names as already-declared, so an
+            // assignment to a parameter is a reassignment (never a `let`).
+            {
+                size_t lp = signature.find('(');
+                size_t rp = signature.rfind(')');
+                if (lp != std::string::npos && rp != std::string::npos && rp > lp)
+                    for (auto &p : rbSplitTopLevel(signature.substr(lp + 1, rp - lp - 1), ','))
+                    {
+                        std::string pn = trimCopy(p);
+                        size_t eq = pn.find('=');
+                        if (eq != std::string::npos)
+                            pn = trimCopy(pn.substr(0, eq)); // default-valued param
+                        if (!pn.empty())
+                            defFrame.declaredLocals.insert(pn);
+                    }
+            }
+            stack.push_back(defFrame);
             continue;
         }
 
@@ -1563,8 +2246,37 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
         if (rbTryTrailingDoOpener(code, prefix, params) && !prefix.empty() &&
             (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
         {
-            std::string convertedPrefix = rbNormalizeAtoms(rbConvertRanges(prefix), symbols, strict);
+            // Multi-line `do` openers bypass transformCore, so the
+            // defaulting-hash read rewriting has to be applied here too
+            // (e.g. `adj[u].each do |v|`).
+            if (strict)
+                prefix = rbApplyDefaultHashReads(prefix, defaultHashes);
+            // `Array.new(n) do |i| ... end` — the generator form with a
+            // multi-line block. Rewrite to a mapped range *before*
+            // rbConvertRanges turns the bare `Array.new(n)` into a
+            // fill-with-nil map that would then take the block as a
+            // stray second argument.
+            if (strict)
+            {
+                static const std::regex arrayNewDoRe("^(.*)Array\\.new\\(([^()]*)\\)$");
+                std::smatch anm;
+                if (std::regex_match(prefix, anm, arrayNewDoRe))
+                    prefix = anm[1].str() + "range(0, " + anm[2].str() + ").map";
+            }
+            std::string convertedPrefix = rbNormalizeAtoms(rbConvertRanges(prefix, strict), symbols, strict);
+            std::string destructure = rbApplyBlockDestructuring(convertedPrefix, params);
+            // Same statement-start array-literal ambiguity guard as in
+            // transformCore (`["a","b"].each do |x|`).
+            if (strict && !convertedPrefix.empty() && convertedPrefix[0] == '[')
+            {
+                size_t close = rbMatchBracket(convertedPrefix, 0);
+                if (close != std::string::npos && close + 1 < convertedPrefix.size() &&
+                    convertedPrefix[close + 1] == '.')
+                    convertedPrefix = ";" + convertedPrefix;
+            }
             outLines.push_back(indentation + rbBuildBlockOpenText(convertedPrefix, params));
+            if (!destructure.empty())
+                outLines.push_back(indentation + "  " + destructure);
             stack.push_back(RBFrame{RBFrameKind::ClosureDo, -1, RBTailInfo{}});
             continue;
         }
@@ -1574,6 +2286,24 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
         {
             outLines.push_back("");
             continue;
+        }
+        // Turn a method-body local's first assignment into a real `let`
+        // declaration (strict .rb only — .sa keeps its existing bare-
+        // assignment semantics, which existing scripts depend on).
+        if (strict)
+        {
+            for (auto it = stack.rbegin(); it != stack.rend(); ++it)
+            {
+                if (it->kind != RBFrameKind::Def)
+                    continue;
+                std::string declName = rbLocalDeclName(finalCode, it->declaredLocals);
+                if (!declName.empty())
+                {
+                    it->declaredLocals.insert(declName);
+                    finalCode = "let " + finalCode;
+                }
+                break;
+            }
         }
         emit(indentation, finalCode, true);
     }
